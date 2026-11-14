@@ -30,6 +30,7 @@
 //   g++ -m32 -shared -O2 -static-libgcc -static-libstdc++ -o re5_char_tweaks.asi dllmain.cpp
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -169,39 +170,78 @@ static const DWORD VA_BONE_MALE = 0xC4D887;
 static const DWORD VA_CODE_PAGE = 0xC4D000;
 
 // Class resource tables (vtable slot +0xA0) with the class (costume) name.
-struct ClassTable { DWORD va; const char* cls; };
+struct ClassTable { DWORD va; const char* cls; const char* label; };
 static const ClassTable kClassTables[] = {
-    { 0x1019C30, "uPl00ChrisNormal" },
-    { 0x1019CF0, "uPl00ChrisArmorA" },
-    { 0x1019DB0, "uPl00ChrisArmorB" },
-    { 0x1019E70, "uPl00ChrisArmorF" },
-    { 0x1019F30, "uPl00ChrisPlain"  },
-    { 0x1019FF0, "uPl00ChrisCos1"   },
-    { 0x101A0B0, "uPl00ChrisCos2"   },
-    { 0x101A170, "uPl00ChrisCos3"   },
-    { 0x101A308, "uPl00ChrisCos4"   },
-    { 0x101A248, "uPl00ChrisEp1"    },
-    { 0x101A3E0, "uPl01ShebaNormal" },
-    { 0x101A4A0, "uPl01ShebaArmorA" },
-    { 0x101A560, "uPl01ShebaArmorB" },
-    { 0x101A620, "uPl01ShebaArmorF" },
-    { 0x101A6E0, "uPl01ShebaPlain"  },
-    { 0x101A7A0, "uPl01ShebaCos1"   },
-    { 0x101A860, "uPl01ShebaCos2"   },
-    { 0x101A920, "uPl01ShebaCos3"   },
-    { 0x101A9F8, "uPl01ShebaCos4"   },
-    { 0x101AAD0, "uPl02JillCos1"    },
-    { 0x101AB90, "uPl02JillCos2"    },
-    { 0x101AC50, "uPl02JillCos3"    },
-    { 0x101AD10, "uPl02JillCos4"    },
-    { 0x101ADD0, "uPl03WeskerCos1"  },
-    { 0x101AE90, "uPl03WeskerCos2"  },
-    { 0x101B010, "uPl04JoshCos1"    },
-    { 0x101B0D0, "uPl04JoshCos2"    },
-    { 0x101B190, "uPl05ExcellaNormal" },
-    { 0x101B268, "uPl06BarryNormal" },
-    { 0x101B328, "uPl07RebeccaNormal" },
+    { 0x1019C30, "uPl00ChrisNormal", "Chris BSAA (no vest)" },
+    { 0x1019CF0, "uPl00ChrisArmorA", "Chris BSAA + melee vest" },
+    { 0x1019DB0, "uPl00ChrisArmorB", "Chris BSAA + bullet vest" },
+    { 0x1019E70, "uPl00ChrisArmorF", "Chris BSAA + melee + bullet vests" },
+    { 0x1019F30, "uPl00ChrisPlain", "Chris jacket (start of the game)" },
+    { 0x1019FF0, "uPl00ChrisCos1", "Chris Safari" },
+    { 0x101A0B0, "uPl00ChrisCos2", "Chris S.T.A.R.S." },
+    { 0x101A170, "uPl00ChrisCos3", "Chris Warrior" },
+    { 0x101A308, "uPl00ChrisCos4", "Chris Heavy Metal" },
+    { 0x101A248, "uPl00ChrisEp1", "Chris Lost in Nightmares" },
+    { 0x101A3E0, "uPl01ShebaNormal", "Sheva BSAA (no vest)" },
+    { 0x101A4A0, "uPl01ShebaArmorA", "Sheva BSAA + melee vest" },
+    { 0x101A560, "uPl01ShebaArmorB", "Sheva BSAA + bullet vest" },
+    { 0x101A620, "uPl01ShebaArmorF", "Sheva BSAA + melee + bullet vests" },
+    { 0x101A6E0, "uPl01ShebaPlain", "Sheva basic gear (start of the game)" },
+    { 0x101A7A0, "uPl01ShebaCos1", "Sheva Tribal" },
+    { 0x101A860, "uPl01ShebaCos2", "Sheva Clubbin'" },
+    { 0x101A920, "uPl01ShebaCos3", "Sheva Business" },
+    { 0x101A9F8, "uPl01ShebaCos4", "Sheva Fairy Tale" },
+    { 0x101AAD0, "uPl02JillCos1", "Jill BSAA" },
+    { 0x101AB90, "uPl02JillCos2", "Jill Battle Suit" },
+    { 0x101AC50, "uPl02JillCos3", "Jill Desperate Escape" },
+    { 0x101AD10, "uPl02JillCos4", "Jill Lost in Nightmares" },
+    { 0x101ADD0, "uPl03WeskerCos1", "Wesker Midnight" },
+    { 0x101AE90, "uPl03WeskerCos2", "Wesker S.T.A.R.S." },
+    { 0x101B010, "uPl04JoshCos1", "Josh Mercenaries Reunion (unused Chris LiN)" },
+    { 0x101B0D0, "uPl04JoshCos2", "Josh Desperate Escape" },
+    { 0x101B190, "uPl05ExcellaNormal", "Excella Mercenaries Reunion" },
+    { 0x101B268, "uPl06BarryNormal", "Barry Mercenaries Reunion" },
+    { 0x101B328, "uPl07RebeccaNormal", "Rebecca Mercenaries Reunion" },
 };
+
+
+// ---------------------------------------------------------------- safe code writes
+// Patching live code has to be atomic w.r.t. other threads: suspend them while
+// the bytes are written, otherwise a thread may execute a half-written jump.
+struct SuspendedThreads { HANDLE h[256]; int n; };
+
+static void suspend_other_threads(SuspendedThreads& st)
+{
+    st.n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    const DWORD pid = GetCurrentProcessId();
+    const DWORD self = GetCurrentThreadId();
+
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            if (st.n >= (int)(sizeof(st.h) / sizeof(st.h[0]))) break;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            if (SuspendThread(h) != (DWORD)-1) st.h[st.n++] = h;
+            else CloseHandle(h);
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+static void resume_threads(SuspendedThreads& st)
+{
+    for (int i = 0; i < st.n; ++i) {
+        ResumeThread(st.h[i]);
+        CloseHandle(st.h[i]);
+    }
+    st.n = 0;
+}
 
 // ---------------------------------------------------------------- chain slots
 static bool looks_like_model_path(DWORD ptr)
@@ -282,22 +322,40 @@ static const char* class_of_player(void* player)
 static void write_bone_bytes(int bone)
 {
     BYTE b = (BYTE)bone;
+    if (g_bone_female == b && g_bone_male == b) return;
+
     DWORD old = 0;
-    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, PAGE_EXECUTE_READWRITE, &old);
+    if (!VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000,
+                        PAGE_EXECUTE_READWRITE, &old))
+        return;
+
+    SuspendedThreads st;
+    suspend_other_threads(st);
     if (g_bone_female != b) { *(BYTE*)(g_code + (VA_BONE_FEM - 0x400000)) = b; g_bone_female = b; }
     if (g_bone_male != b)   { *(BYTE*)(g_code + (VA_BONE_MALE - 0x400000)) = b; g_bone_male = b; }
-    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, old, &old);
     FlushInstructionCache(GetCurrentProcess(), g_code + (VA_CODE_PAGE - 0x400000), 0x1000);
+    resume_threads(st);
+
+    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, old, &old);
 }
 
 static void reset_bone_bytes()
 {
+    if (g_bone_female == 0x02 && g_bone_male == 0x75) return;
+
     DWORD old = 0;
-    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, PAGE_EXECUTE_READWRITE, &old);
+    if (!VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000,
+                        PAGE_EXECUTE_READWRITE, &old))
+        return;
+
+    SuspendedThreads st;
+    suspend_other_threads(st);
     if (g_bone_female != 0x02) { *(BYTE*)(g_code + (VA_BONE_FEM - 0x400000)) = 0x02; g_bone_female = 0x02; }
     if (g_bone_male != 0x75)   { *(BYTE*)(g_code + (VA_BONE_MALE - 0x400000)) = 0x75; g_bone_male = 0x75; }
-    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, old, &old);
     FlushInstructionCache(GetCurrentProcess(), g_code + (VA_CODE_PAGE - 0x400000), 0x1000);
+    resume_threads(st);
+
+    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, old, &old);
 }
 
 // ---------------------------------------------------------------- decision
@@ -394,10 +452,18 @@ static bool patch_site(BYTE* site)
 
     DWORD old = 0;
     if (!VirtualProtect(tail, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
-    tail[0] = 0xE9;
-    *(DWORD*)(tail + 1) = (DWORD)g_stub - ((DWORD)tail + 5);
-    VirtualProtect(tail, 5, old, &old);
+
+    BYTE code[5];
+    code[0] = 0xE9;
+    *(DWORD*)(code + 1) = (DWORD)g_stub - ((DWORD)tail + 5);
+
+    SuspendedThreads st;
+    suspend_other_threads(st);
+    memcpy(tail, code, 5);
     FlushInstructionCache(GetCurrentProcess(), tail, 5);
+    resume_threads(st);
+
+    VirtualProtect(tail, 5, old, &old);
     return true;
 }
 
@@ -482,7 +548,8 @@ static void write_default_ini(const char* dir)
     fputs("\n[default]\nback=-1\ncustom_bone=0\nbone=0\nchn=0\n\n", f);
     for (const ClassTable& ct : kClassTables) {
         int back = (strcmp(ct.cls, "uPl05ExcellaNormal") == 0) ? 1 : -1;
-        fprintf(f, "[%s]\nback=%d\ncustom_bone=0\nbone=0\nchn=0\n\n", ct.cls, back);
+        fprintf(f, "; %s\n[%s]\nback=%d\ncustom_bone=0\nbone=0\nchn=0\n\n",
+                ct.label, ct.cls, back);
     }
     fclose(f);
 }

@@ -27,11 +27,13 @@ can ship per-costume override files without touching the master config.
 ## Requirements
 
 - Windows, 32-bit game (`re5dx9.exe`), RE5 Gold Edition / Steam build.
-- **[Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)**
-  by ThirteenAG — the supported ASI loader. Download the 32-bit `dinput8.dll`
-  from its releases and put it in the game root (next to `re5dx9.exe`). It
-  loads `.asi` files from the game root and from the `scripts`, `plugins`, and
-  `update` folders.
+- **[Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
+  6.0.0 (Win32)** by ThirteenAG — the tested and recommended loader. The
+  working binary is bundled in `dist/loader/dinput8.dll`
+  (2,197,504 bytes, SHA-256 `96450A3158588219392620A194B2E538298230136F59481A3ED98E19435CC0F1`).
+  Put it in the game root (next to `re5dx9.exe`).
+  **Do not use v10.0.2** — its new file-overload/DXGI hooks crash RE5 at
+  startup (the exe is Enigma-packed), even with no `.asi` installed.
 - Works with both the 2018 Steam build and the Enigma-packed retail build:
   the decision check is located at runtime by **signature**, not by a fixed
   address.
@@ -40,10 +42,10 @@ can ship per-costume override files without touching the master config.
 
 ## Installation
 
-1. Install **Ultimate ASI Loader** (32-bit) into the game root as
-   `dinput8.dll` (see above).
-2. Copy `dist/re5_char_tweaks.asi` to `scripts\` (or the game root,
-   `plugins\`, or `update\`).
+1. If the game folder has no working ASI loader, copy
+   `dist/loader/dinput8.dll` to the game root (next to `re5dx9.exe`).
+2. Copy `dist/re5_char_tweaks.asi` to `scripts\` (or the game root or
+   `plugins\`; the bundled 6.0.0 loader scans those folders).
 3. Copy `dist/re5_char_tweaks.ini` **next to the `.asi`**.
 4. Optional: create `re5_char_overrides\` next to the `.asi` for per-mod
    overrides (see below).
@@ -81,16 +83,40 @@ chn=0
 
 ### Class list
 
-| Character | Classes |
-|---|---|
-| Chris | `uPl00ChrisNormal`, `uPl00ChrisArmorA/B/F`, `uPl00ChrisPlain`, `uPl00ChrisCos1..4`, `uPl00ChrisEp1` |
-| Sheva | `uPl01ShebaNormal`, `uPl01ShebaArmorA/B/F`, `uPl01ShebaPlain`, `uPl01ShebaCos1..4` |
-| Jill | `uPl02JillCos1..4` |
-| Wesker | `uPl03WeskerCos1..2` |
-| Josh | `uPl04JoshCos1..2` |
-| Excella | `uPl05ExcellaNormal` |
-| Barry | `uPl06BarryNormal` |
-| Rebecca | `uPl07RebeccaNormal` |
+Each section in the INI is prefixed with the costume name as a comment.
+
+| Character | Class | Costume |
+|---|---|---|
+| Chris | `uPl00ChrisNormal` | BSAA (no vest) |
+| Chris | `uPl00ChrisArmorA` | BSAA + melee vest |
+| Chris | `uPl00ChrisArmorB` | BSAA + bullet vest |
+| Chris | `uPl00ChrisArmorF` | BSAA + melee + bullet vests |
+| Chris | `uPl00ChrisPlain` | jacket (start of the game) |
+| Chris | `uPl00ChrisCos1` | Safari |
+| Chris | `uPl00ChrisCos2` | S.T.A.R.S. |
+| Chris | `uPl00ChrisCos3` | Warrior |
+| Chris | `uPl00ChrisCos4` | Heavy Metal |
+| Chris | `uPl00ChrisEp1` | Lost in Nightmares |
+| Sheva | `uPl01ShebaNormal` | BSAA (no vest) |
+| Sheva | `uPl01ShebaArmorA` | BSAA + melee vest |
+| Sheva | `uPl01ShebaArmorB` | BSAA + bullet vest |
+| Sheva | `uPl01ShebaArmorF` | BSAA + melee + bullet vests |
+| Sheva | `uPl01ShebaPlain` | basic gear (start of the game) |
+| Sheva | `uPl01ShebaCos1` | Tribal |
+| Sheva | `uPl01ShebaCos2` | Clubbin' |
+| Sheva | `uPl01ShebaCos3` | Business |
+| Sheva | `uPl01ShebaCos4` | Fairy Tale |
+| Jill | `uPl02JillCos1` | BSAA |
+| Jill | `uPl02JillCos2` | Battle Suit |
+| Jill | `uPl02JillCos3` | Desperate Escape |
+| Jill | `uPl02JillCos4` | Lost in Nightmares |
+| Wesker | `uPl03WeskerCos1` | Midnight |
+| Wesker | `uPl03WeskerCos2` | S.T.A.R.S. |
+| Josh | `uPl04JoshCos1` | Mercenaries Reunion (unused Chris LiN) |
+| Josh | `uPl04JoshCos2` | Desperate Escape |
+| Excella | `uPl05ExcellaNormal` | Mercenaries Reunion |
+| Barry | `uPl06BarryNormal` | Mercenaries Reunion |
+| Rebecca | `uPl07RebeccaNormal` | Mercenaries Reunion |
 
 Useful joint numbers (Sheva, `pl0100.mod`): `2` spine, `4` neck, `100` face,
 `19`/`22` feet, `18`/`21` shins.
@@ -195,7 +221,8 @@ chain slots: uPl07RebeccaNormal table=... chn=on ccl=on
 
 | Symptom | Cause |
 |---|---|
-| no log at all | no ASI loader in the game folder |
+| no log at all | no ASI loader in the game folder, or a loader that crashes RE5 (v10.0.2) |
+| crash at startup with no log | loader v10.0.2 — use the bundled 6.0.0 `dinput8.dll` |
 | `done (patched=0)` + `site found` missing | the signature was not found — send the log |
 | `tail mismatch at ...` | the site bytes differ in your build — send the log |
 | `class=` empty / `?` | class identification failed — send the log |
@@ -225,5 +252,7 @@ If the log is missing, check that Ultimate ASI Loader is installed and that the
 
 - [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
   by ThirteenAG — the supported ASI loader (not bundled with this mod).
+- Costume names follow the community **RE5 GE - ARC LIST**
+  ([residentevilmodding.boards.net](https://residentevilmodding.boards.net/thread/3989/re5-ge-arc-list)).
 - The mechanism was reverse-engineered from `re5dx9.exe` (2018 Steam build)
   and verified in-game. Research notes: [`docs/TECHNICAL.md`](docs/TECHNICAL.md).

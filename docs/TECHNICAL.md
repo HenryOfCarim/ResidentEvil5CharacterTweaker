@@ -149,16 +149,25 @@ Tables (2018 build):
 
 ## 3. ASI loader
 
-The mod is a 32-bit DLL loaded as `.asi`. It ships no loader; the supported
-one is **Ultimate ASI Loader** by ThirteenAG
-(<https://github.com/ThirteenAG/Ultimate-ASI-Loader>). It is installed as
-`dinput8.dll` in the game root and loads `.asi` files from the game root and
-the `scripts`, `plugins`, and `update` folders.
+The mod is a 32-bit DLL loaded as `.asi`. The tested loader is **Ultimate ASI
+Loader 6.0.0 (Win32)** by ThirteenAG
+(<https://github.com/ThirteenAG/Ultimate-ASI-Loader>), bundled as
+`dist/loader/dinput8.dll`:
+
+- size `2,197,504` bytes;
+- SHA-256 `96450A3158588219392620A194B2E538298230136F59481A3ED98E19435CC0F1`;
+- VERSIONINFO: `FileVersion 6.0.0`, `InternalName Ultimate-ASI-Loader-Win32`.
+
+It is installed as `dinput8.dll` in the game root and loads `.asi` files from
+the game root and the `scripts` / `plugins` folders.
+
+**Version note:** v10.0.2 crashes RE5 at startup — its new file-overload /
+DXGI hooks break the Enigma-packed `re5dx9.exe`, even with no `.asi` loaded.
+The 6.0.0 build predates those hooks.
 
 The game imports exactly one function from `DINPUT8.dll`
-(`DirectInput8Create`), so any proxy-based ASI loader using that name works.
-A minimal proxy was used during development to replace a missing loader; it is
-not part of the release.
+(`DirectInput8Create`), so any proxy-based ASI loader using that name can work,
+provided it does not hook the packed executable's startup path.
 
 ---
 
