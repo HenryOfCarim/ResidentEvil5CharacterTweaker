@@ -43,6 +43,9 @@
 #include <stdint.h>
 #include <ctype.h>
 
+static bool looks_like_model_path(DWORD ptr);
+static BYTE* scan_for_bytes(const BYTE* sig, size_t len);
+
 // ---------------------------------------------------------------- config
 struct Section {
     char name[64];
@@ -379,46 +382,120 @@ static void resume_threads(SuspendedThreads& st)
     st.n = 0;
 }
 
+struct ClassModel { const char* cls; const char* model; };
+static const ClassModel kClassModels[] = {
+    { "uPl00ChrisNormal",   "pawn\\pl\\pl00\\model\\pl0000" },
+    { "uPl00ChrisArmorA",   "pawn\\pl\\pl00\\model\\pl0500" },
+    { "uPl00ChrisArmorB",   "pawn\\pl\\pl00\\model\\pl0900" },
+    { "uPl00ChrisArmorF",   "pawn\\pl\\pl00\\model\\pl0a00" },
+    { "uPl00ChrisPlain",    "pawn\\pl\\pl03\\model\\pl0300" },
+    { "uPl00ChrisCos1",     "pawn\\pl\\pl10\\model\\pl0000" },
+    { "uPl00ChrisCos2",     "pawn\\pl\\pl11\\model\\pl1100" },
+    { "uPl00ChrisCos3",     "pawn\\pl\\pl20\\model\\pl0000" },
+    { "uPl00ChrisCos4",     "pawn\\pl\\pl22\\model\\pl0000" },
+    { "uPl00ChrisEp1",      "pawn\\pl\\pl04\\model\\pl0400" },
+    { "uPl01ShebaNormal",   "pawn\\pl\\pl01\\model\\pl0100" },
+    { "uPl01ShebaArmorA",   "pawn\\pl\\pl01\\model\\pl0600" },
+    { "uPl01ShebaArmorB",   "pawn\\pl\\pl01\\model\\pl0b00" },
+    { "uPl01ShebaArmorF",   "pawn\\pl\\pl01\\model\\pl0c00" },
+    { "uPl01ShebaPlain",    "pawn\\pl\\pl0d\\model\\pl0d00" },
+    { "uPl01ShebaCos1",     "pawn\\pl\\pl12\\model\\pl1200" },
+    { "uPl01ShebaCos2",     "pawn\\pl\\pl13\\model\\pl0100" },
+    { "uPl01ShebaCos3",     "pawn\\pl\\pl21\\model\\pl2100" },
+    { "uPl01ShebaCos4",     "pawn\\pl\\pl23\\model\\pl2300" },
+    { "uPl02JillCos1",      "pawn\\pl\\pl02\\model\\Pl0200" },
+    { "uPl02JillCos2",      "pawn\\pl\\pl14\\model\\pl1400" },
+    { "uPl02JillCos3",      "pawn\\pl\\pl17\\model\\pl1700" },
+    { "uPl02JillCos4",      "pawn\\pl\\pl02\\model\\pl0200" },
+    { "uPl03WeskerCos1",    "pawn\\pl\\pl15\\model\\pl1500" },
+    { "uPl03WeskerCos2",    "pawn\\pl\\pl16\\model\\pl1600" },
+    { "uPl04JoshCos1",      "pawn\\em\\em88\\model\\em8800" },
+    { "uPl04JoshCos2",      "pawn\\pl\\pl18\\model\\pl1800" },
+    { "uPl05ExcellaNormal", "pawn\\pl\\pl1e\\model\\pl1e00" },
+    { "uPl06BarryNormal",   "pawn\\pl\\pl1c\\model\\pl1c00" },
+    { "uPl07RebeccaNormal", "pawn\\pl\\pl1d\\model\\pl1d00" },
+};
+
+static void* g_loader_tramp = nullptr;
+
+// Patch slots 17/18 (rChain/rChainCol) right before the resource loader walks
+// the class resource table. Identifies the class by the model path in slot 0.
+static void patch_chain_table(DWORD* table, unsigned count)
+{
+    if (!table || count < 19) return;
+    const char* model = (const char*)table[0];
+    if (!looks_like_model_path((DWORD)(uintptr_t)model)) return;
+
+    const ClassModel* cm = nullptr;
+    for (const ClassModel& m : kClassModels)
+        if (_stricmp(m.model, model) == 0) { cm = &m; break; }
+    if (!cm) return;
+
+    Cfg cfg = resolve_cfg(cm->cls);
+    if (cfg.chn <= 0) return;
+
+    DWORD* chn = table + (0x88 / 4);
+    DWORD* ccl = table + (0x90 / 4);
+    bool want_chn = (cfg.chn & 1) && (*chn == 0);
+    bool want_ccl = (cfg.chn & 2) && (*ccl == 0);
+    if (!want_chn && !want_ccl) return;
+
+    DWORD old = 0;
+    if (!VirtualProtect(chn, 8, PAGE_READWRITE, &old)) return;
+    if (want_chn) *chn = (DWORD)(uintptr_t)model;
+    if (want_ccl) *ccl = (DWORD)(uintptr_t)model;
+    VirtualProtect(chn, 8, old, &old);
+    log_line("chain slots(load): %s chn=%d ccl=%d", cm->cls, want_chn, want_ccl);
+}
+
+static void __attribute__((thiscall)) loader_hook(void* self, void* table, unsigned count)
+{
+    typedef void (__attribute__((thiscall)) *Fn)(void*, void*, unsigned);
+    patch_chain_table((DWORD*)table, count);
+    Fn orig = (Fn)g_loader_tramp;
+    if (orig) orig(self, table, count);
+}
+
+static BYTE* find_resource_loader()
+{
+    static const BYTE sig[] = {
+        0x53, 0x55, 0x57, 0x8B, 0x7C, 0x24, 0x10, 0x33, 0xDB, 0x3B, 0xFB, 0x8B, 0xE9
+    };
+    return scan_for_bytes(sig, sizeof(sig));
+}
+
+static bool install_loader_hook()
+{
+    static bool reported = false;
+    BYTE* fn = find_resource_loader();
+    if (!fn) {
+        if (!reported) { reported = true; log_line("chain slots: resource loader not found (will retry)"); }
+        return false;
+    }
+    BYTE* t = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return false;
+    memcpy(t, fn, 7);
+    t[7] = 0xE9;
+    *(DWORD*)(t + 8) = (DWORD)(fn + 7) - ((DWORD)(t + 7) + 5);
+    g_loader_tramp = t;
+
+    DWORD old = 0;
+    if (!VirtualProtect(fn, 7, PAGE_EXECUTE_READWRITE, &old)) return false;
+    fn[0] = 0xE9;
+    *(DWORD*)(fn + 1) = (DWORD)&loader_hook - ((DWORD)fn + 5);
+    fn[5] = 0x90; fn[6] = 0x90;
+    VirtualProtect(fn, 7, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), fn, 7);
+    log_line("chain slots: resource loader at %p", (void*)fn);
+    return true;
+}
+
 // ---------------------------------------------------------------- chain slots
 static bool looks_like_model_path(DWORD ptr)
 {
     if (ptr < 0x400000 || ptr > 0x20000000) return false;
     const char* s = (const char*)ptr;
     return s[0] == 'p' && s[1] == 'a' && s[2] == 'w' && s[3] == 'n';
-}
-
-static int apply_chain_slots()
-{
-    if (!g_code) return 0;
-    int written = 0;
-
-    for (const ClassTable& ct : kClassTables) {
-        Cfg cfg = resolve_cfg(ct.cls);
-        if (cfg.chn <= 0) continue;
-
-        DWORD* table = (DWORD*)(g_code + (ct.va - 0x400000));
-        DWORD model = table[0];
-        if (!looks_like_model_path(model)) continue;
-
-        DWORD* chn = table + (0x88 / 4);
-        DWORD* ccl = table + (0x90 / 4);
-
-        bool want_chn = (cfg.chn & 1) && (*chn == 0);
-        bool want_ccl = (cfg.chn & 2) && (*ccl == 0);
-        if (!want_chn && !want_ccl) continue;
-
-        DWORD old = 0;
-        if (!VirtualProtect(chn, 8, PAGE_READWRITE, &old)) continue;
-        if (want_chn) *chn = model;
-        if (want_ccl) *ccl = model;
-        VirtualProtect(chn, 8, old, &old);
-
-        log_line("chain slots: %s table=%p model=%p chn=%s ccl=%s",
-                 ct.cls, (void*)table, (void*)model,
-                 want_chn ? "on" : "skip", want_ccl ? "on" : "skip");
-        written += (want_chn ? 1 : 0) + (want_ccl ? 1 : 0);
-    }
-    return written;
 }
 
 // ---------------------------------------------------------------- class of player
@@ -1446,6 +1523,11 @@ static DWORD WINAPI worker(LPVOID)
         parse_ini(cfg_chars, "default");
 
     init_file_overrides(dir, exe_dir);
+
+    for (int i = 0; i < 60; ++i) {
+        if (install_loader_hook()) break;
+        Sleep(1000);
+    }
     log_line("start: module=%p", (void*)g_code);
     log_line("config: settings=%s", has_settings ? cfg_settings : "(none)");
     log_line("config: characters=%s", has_chars ? cfg_chars : "(none)");
@@ -1493,7 +1575,6 @@ static DWORD WINAPI worker(LPVOID)
                 }
             }
         }
-        apply_chain_slots();
         if (patched && i > 30) break;
         Sleep(1000);
     }

@@ -148,6 +148,11 @@ Tables (2018 build):
 | uPl07RebeccaNormal | `0x101B328` |
 
 `uChainEx` factory: `0x850D50`; `uChain::setColResource`: `0x612260`;
+The mod patches slots 17/18 at resource-load time: it hooks the resource-set
+loader (`0xBC2490`, signature `53 55 57 8B 7C 24 10 33 DB 3B FB 8B E9`), reads
+the class resource table pointer from the first argument, identifies the class
+by the model path in slot 0, and fills the empty slots with that path when the
+class's `chn` setting is enabled.
 `uChain::setup`: `0x612F80`.
 
 ---

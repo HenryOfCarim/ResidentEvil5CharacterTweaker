@@ -220,8 +220,11 @@ The mod:
    (`6A 02 50 FF D2 8D 87 F0 …` / `6A 75 50 FF D2 8D 87 D0 …`, 0x2F apart)
    and only the immediate byte is rewritten;
 5. for `chn`, the class resource table slots 17 (`+0x88`, `rChain`) and 18
-   (`+0x90`, `rChainCol`) are filled with the model-name pointer when they are
-   `NULL`, which makes the loader request `.chn` / `.ccl` from the archive.
+   (`+0x90`, `rChainCol`) are filled at **resource-load time**: the mod hooks
+   the resource-set loader (`0xBC2490`), reads the table pointer from its first
+   argument, identifies the class by the model path in slot 0 and writes that
+   path into the empty slots, so the loader requests `.chn` / `.ccl` from the
+   archive.
 
 File overrides are a separate pair of detours (details in
 [`docs/TECHNICAL.md`](docs/TECHNICAL.md) §4): `sResource::precreate` is stopped
