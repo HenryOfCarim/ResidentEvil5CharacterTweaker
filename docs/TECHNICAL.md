@@ -1,7 +1,8 @@
 # Technical notes
 
-Reverse-engineering notes for the back-weapon mount and the `.chn` / `.ccl`
-binding in **Resident Evil 5 (PC, `re5dx9.exe`)**.
+Reverse-engineering notes for the back-weapon mount, the `.chn` / `.ccl`
+binding and the loose-file (`.arc` override) mechanism in
+**Resident Evil 5 (PC, `re5dx9.exe`)**.
 
 Reference binary: 2018 Steam PC build, 15,046,608 bytes, ImageBase `0x400000`,
 `RVA = VA - 0x400000`. The retail game is packed (Steam + Enigma) and the code
@@ -175,7 +176,103 @@ provided it does not hook the packed executable's startup path.
 
 ---
 
-## 4. Caveats
+## 4. File overrides (loose files)
+
+Goal: a file placed outside the archives (`re5_file_overrides\<archive path>.<ext>`)
+replaces the matching `.arc` entry, for any file size, without repacking.
+
+### 4.1 Why a loose file cannot win on its own
+
+When an `.arc` is mounted, `rArchive::load` (2018 build `0x626BC0`) parses the
+whole TOC and registers **every** entry in the `sResource` hash table:
+
+```
+rArchive::load -> entryDecode (0x455120) -> precreate (0x454490) -> registTable (0x454F90)
+```
+
+`precreate` also marks the object as archive-backed (`mAttr |= 0x80`) and stores
+the entry offset/size. Later `sResource::create` (`0x4547C0`) does
+`makeID` -> `findTable` and returns that object; the disk path is only built
+when the lookup misses. A loose file is therefore just a *fallback* for
+resources that are not in the table (which is why "stub arcs" work), and the
+priority depends on who registered the id first.
+
+### 4.2 The two detours
+
+```
+sResource::precreate   (0x454490)  ecx = DTI, [esp+4] = sResource*,
+                                   [esp+8] = TOC path (no extension)
+sResource::getFullPath (0x454420)  eax = sResource*, ecx = cResource*,
+                                   [esp+4] = dst, [esp+8] = short-path flag
+```
+
+* `precreate` — if the entry has a matching override file, the archive entry is
+  **not** registered. Instead the resource is loaded from disk with
+  `create(dti, path, 1)` (`0x4547C0`, mode 1 = "load from HDD") and that object
+  is returned to `entryDecode`. It is already registered and has `mState |= 1`,
+  so `executeDecode` skips the archive data.
+* `getFullPath` — the original builds `"%s\%s.%s"` (`0x10AEA5C`) from
+  `mResourcePath` + `pr->mPath` + `getExt()`. A post-processing stub rewrites
+  the result to `<asi dir>\re5_file_overrides\<path>.<ext>` when a matching
+  file exists, so nothing has to be copied into `nativePC_MT`.
+
+### 4.3 Getting the resource type right
+
+The TOC path has **no extension**; the type comes from the DTI. It must be
+resolved exactly or every resource sharing the base name is rebound:
+
+```c
+void** vt = *(void***)dti;
+void*  obj = vcall_thiscall0(dti, vt[1]);        // dti->newInstance()
+void** ovt = *(void***)obj;
+const char* ext = vcall_thiscall0(obj, ovt[6]);  // cResource::getExt() @ +0x18
+```
+
+Without this check, an override for `pl0000.mod` also rebinds `pl0000.chn`,
+`pl0000.ccl`, `pl0000.mtg` … For each of them `create(...)` is called, and a
+missing `.chn` is fatal: the engine exits with
+
+```
+Failed open file. ...\nativePC_MT\pawn\pl\pl00\model\pl0000.chn 0
+```
+
+Additional guard: after `create` returns, `mState & 1` (`cResource + 0x4C`) is
+checked; if the resource did not actually load, the archive entry is used as
+before (a broken override is not fatal).
+
+### 4.4 Enigma and the delivery delay
+
+The retail exe is Enigma-packed and checks its own code integrity at startup.
+Patching any of the functions above before that check finishes makes the game
+show `Program integrity check failed ... This program will now close`. The hooks
+are therefore installed after `delay_ms` (10 s by default), which is late
+enough for the check and early enough for character/stage archives (they are
+mounted tens of seconds into a level).
+
+### 4.5 Signatures used at runtime
+
+```
+sResource::create       55 8B EC 83 E4 F8 83 EC 0C 8B 45 08
+sResource::precreate    83 EC 08 53 8B 5C 24 10 55 8B 6C 24 18
+sResource::getFullPath  53 8B 5C 24 08 85 DB 56 8B F1 74 5D
+sResource::releaseTable 53 55 8B 6C 24 10 8B 5D 5C 56 57 8B 7D 58   (reload only)
+rArchive::load          55 8B EC 83 E4 F8 83 EC 1C 53 56 8B 75 08
+```
+
+Observed on the Enigma-packed retail build: `create` `0x448B70`, `precreate`
+`0x448840`, `getFullPath` `0x4487D0`, `rArchive::load` `0x40FB50` — i.e. the
+2018-build addresses are shifted, so only the signatures are reliable.
+
+### 4.6 Coexistence
+
+If `re5_loose_loader.asi` (the standalone loader) is present in the same folder,
+this mod skips its own override hooks — two detours on the same functions would
+patch each other's jump and crash. In that configuration the standalone
+loader's `re5_overrides\` folder is the active one.
+
+---
+
+## 5. Caveats
 
 - All fixed addresses above are for the 2018 Steam build; the retail protected
   build differs. The mod relies on the signature and on the resource-table
@@ -184,3 +281,8 @@ provided it does not hook the packed executable's startup path.
   the mod only fills the slots.
 - A `.chn` references joints by `ref_joint_no`; a chain from another character
   may not fit.
+- File overrides are keyed by the archive-internal path, so costumes stored in
+  different `.arc` files under the same path (`pawn\pl\pl00\model\pl0000`)
+  are all overridden. For a single costume, repack that `.arc`.
+- Resources the game never requests through `sResource::create` cannot be
+  overridden by a hook; they still need repacking.

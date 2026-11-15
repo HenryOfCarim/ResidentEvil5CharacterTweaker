@@ -8,6 +8,9 @@ An ASI mod for **Resident Evil 5 (PC)** that adds **per-costume** tweaks:
   whose class resource table has `NULL` slots (Rebecca, Josh, Chris `.ccl`,
   Barry `.ccl`, and custom classes), so files added to the archive are actually
   loaded.
+- **File overrides (loose files)** — drop unpacked files into
+  `re5_file_overrides\` and they replace the matching `.arc` entries (any file
+  size, no repacking).
 
 Configuration is keyed by **class name (costume)**, not by character, and mods
 can ship per-costume override files without touching the master config.
@@ -22,6 +25,7 @@ can ship per-costume override files without touching the master config.
 | Custom mount joint | `custom_bone` + `bone` | `0/1`, joint No `0..127` |
 | Chain simulation | `chn` | `0` off, `1` `.chn`, `2` `.ccl`, `3` both |
 | Dump weapon offsets | `dump_weapons` | `1` writes `%TEMP%\re5_weapon_offsets.txt` |
+| File overrides | `file_overrides` | `1` on, `0` off (files from `re5_file_overrides\`) |
 
 ---
 
@@ -219,6 +223,14 @@ The mod:
    (`+0x90`, `rChainCol`) are filled with the model-name pointer when they are
    `NULL`, which makes the loader request `.chn` / `.ccl` from the archive.
 
+File overrides are a separate pair of detours (details in
+[`docs/TECHNICAL.md`](docs/TECHNICAL.md) §4): `sResource::precreate` is stopped
+from registering the archive entry and the resource is loaded from disk
+instead, and `sResource::getFullPath` is redirected to `re5_file_overrides\`.
+The resource type is resolved from the DTI, so only the matching
+`(path, type)` is replaced, and the hooks are installed after the Enigma
+integrity check (`delay_ms`).
+
 ### Weapon mount offsets (advanced)
 
 The position/rotation of a holstered weapon relative to its joint is stored per
@@ -393,6 +405,14 @@ If the log is missing, check that Ultimate ASI Loader is installed and that the
   tested.
 - Not compatible with other mods that hook the same decision site or patch the
   same resource-table slots.
+- File overrides are keyed by the archive-internal path: costumes stored in
+  different `.arc` files under the same path are all overridden. For a single
+  costume, repack that `.arc`.
+- Resources the game does not request through `sResource::create` cannot be
+  overridden by a hook; those still need repacking.
+- No in-game reload: an overridden file is read when the resource is loaded
+  (level start / spawn), so replacing it requires a reload of that resource
+  (the standalone `re5_loose_loader.asi` adds a warm-reload helper).
 - One instance per process.
 
 ---
