@@ -1,4 +1,4 @@
-# RE5 Char Tweaks
+# RE5 Char Tweaker
 
 An ASI mod for **Resident Evil 5 (PC)** that adds **per-costume** tweaks:
 
