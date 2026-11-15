@@ -86,10 +86,14 @@ c4d8b5: push $0x2                ; joint 2 (spine, female)
 
 Both are 2-byte `push imm8` instructions, so the joint can be changed in place:
 
-| branch | VA (2018) | bytes |
-|---|---|---|
-| joint 117 | `0xC4D886` | `6A 75` |
-| joint 2 | `0xC4D8B5` | `6A 02` |
+| branch | VA (2018) | bytes | signature used by the mod |
+|---|---|---|---|
+| joint 117 | `0xC4D886` | `6A 75` | `6A 75 50 FF D2 8D 87 D0 00 00 00` |
+| joint 2 | `0xC4D8B5` | `6A 02` | `6A 02 50 FF D2 8D 87 F0 00 00 00` |
+
+The retail Enigma build shifts this code as well (`0xC4D8B6` contains
+unrelated bytes `00 3B`), so the mod finds both sites by the signatures above
+(they are `0x2F` bytes apart) and rewrites only the immediate byte.
 
 `uPlayer + 0x1AF8`: `0` = joint 117, non-zero = joint 2.
 

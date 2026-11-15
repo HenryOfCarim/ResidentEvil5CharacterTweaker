@@ -1,13 +1,19 @@
 // re5_char_tweaks.asi — per-costume (class) tweaks for RE5 (PC).
 //
-// Config:
-//   <dir>\re5_char_tweaks.ini              master config, one section per class
-//   <dir>\re5_char_overrides\<class>.ini   per-mod overrides, e.g.
-//                                          uPl00ChrisCos3.ini with plain keys
-// where <dir> is the folder of this .asi (scripts\), falling back to the game
-// folder.
+// Config files, all in the folder of this .asi (scripts\), falling back to the
+// game folder. Names are lowercase snake_case, one prefix per mod:
+//   re5_ct_settings.ini     global switches (file overrides, delays, dumps)
+//   re5_ct_characters.ini   one section per class (costume)
+//   re5_ct_weapons.ini      one section per weapon (mount offsets)
+//   re5_char_overrides\     per-mod class overrides, <class>.ini with plain keys
+//   re5_weapon_overrides\   per-mod weapon overrides, <WPxx>.ini
+//   re5_file_overrides\     loose file overrides, <archive-internal path>.<ext>
 //
-// Sections are the exact class names (costumes), plus [default]:
+// The legacy names re5_char_tweaks.ini and re5_weapon_offsets.ini are still
+// read when the new file is absent, so old installations keep working.
+//
+// Sections in re5_ct_characters.ini are the exact class names (costumes), plus
+// [default]:
 //   [uPl00ChrisCos3]
 //   back=0
 //   custom_bone=1
@@ -34,6 +40,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <ctype.h>
 
 // ---------------------------------------------------------------- config
 struct Section {
@@ -43,6 +51,10 @@ struct Section {
 };
 
 struct Cfg { int back, custom, bone, chn; };
+
+static int g_dump_weapons = 1;
+static int g_file_overrides_on = 1;
+static int g_delay_ms = 10000;
 
 static Section g_sections[128];
 static int     g_section_count = 0;
@@ -73,6 +85,49 @@ static void trim(char* s)
     size_t n = strlen(s);
     while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n'))
         s[--n] = 0;
+}
+
+// ---------------------------------------------------------------- config files
+// All lowercase snake_case, one prefix per mod. The legacy names are still
+// accepted when the new file does not exist.
+static const char kCfgSettings[] = "re5_ct_settings.ini";
+static const char kCfgCharacters[] = "re5_ct_characters.ini";
+static const char kCfgWeapons[] = "re5_ct_weapons.ini";
+static const char kCfgLegacyMaster[] = "re5_char_tweaks.ini";
+static const char kCfgLegacyWeapons[] = "re5_weapon_offsets.ini";
+
+static bool file_exists(const char* path)
+{
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void path_join(char* dst, size_t dst_size, const char* dir, const char* name)
+{
+    strncpy_s(dst, dst_size, dir, _TRUNCATE);
+    strcat_s(dst, dst_size, name);
+}
+
+// Looks for <dir>\<name>, then <dir>\<legacy>, then the same under exe_dir.
+static bool find_config(char* out, size_t out_size, const char* dir,
+                        const char* exe_dir, const char* name, const char* legacy)
+{
+    const char* dirs[2] = { dir, exe_dir };
+    const char* names[2] = { name, legacy };
+
+    for (int d = 0; d < 2; ++d) {
+        if (!dirs[d] || !*dirs[d]) continue;
+        if (d == 1 && _stricmp(dirs[0], dirs[1]) == 0) continue;
+        for (int n = 0; n < 2; ++n) {
+            if (!names[n] || !*names[n]) continue;
+            char p[MAX_PATH];
+            path_join(p, sizeof(p), dirs[d], names[n]);
+            if (file_exists(p)) {
+                strncpy_s(out, out_size, p, _TRUNCATE);
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // default_section: used for keys that appear before the first [section] line.
@@ -111,7 +166,10 @@ static void parse_ini(const char* path, const char* default_section)
         Section* s = find_section(current);
         if (!s) continue;
 
-        if (_stricmp(key, "back") == 0) { s->back = atoi(val); s->has_back = 1; }
+        if (_stricmp(key, "dump_weapons") == 0) { g_dump_weapons = atoi(val); }
+        else if (_stricmp(key, "file_overrides") == 0) { g_file_overrides_on = atoi(val); }
+        else if (_stricmp(key, "delay_ms") == 0) { g_delay_ms = atoi(val); }
+        else if (_stricmp(key, "back") == 0) { s->back = atoi(val); s->has_back = 1; }
         else if (_stricmp(key, "custom_bone") == 0) { s->custom = atoi(val); s->has_custom = 1; }
         else if (_stricmp(key, "bone") == 0) { s->bone = atoi(val); s->has_bone = 1; }
         else if (_stricmp(key, "chn") == 0) { s->chn = atoi(val); s->has_chn = 1; }
@@ -140,6 +198,79 @@ static Cfg resolve_cfg(const char* cls)
     return r;
 }
 
+// ---------------------------------------------------------------- weapon offsets
+struct WeaponCfg {
+    float pos117[3], rot117[3], pos2[3], rot2[3];
+    unsigned char has_pos117, has_rot117, has_pos2, has_rot2;
+};
+
+static WeaponCfg g_weapons[256];
+
+static int weapon_id_from_name(const char* s)
+{
+    while (*s == ' ' || *s == '\t') ++s;
+    if ((s[0] == 'W' || s[0] == 'w') && (s[1] == 'P' || s[1] == 'p')) s += 2;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    char* end = nullptr;
+    long v = strtol(s, &end, 16);
+    if (end == s || v < 0 || v > 255) return -1;
+    return (int)v;
+}
+
+static int parse_vec3(const char* v, float out[3])
+{
+    float a, b, c;
+    if (sscanf(v, " %f , %f , %f", &a, &b, &c) == 3 ||
+        sscanf(v, " %f %f %f", &a, &b, &c) == 3) {
+        out[0] = a; out[1] = b; out[2] = c;
+        return 1;
+    }
+    return 0;
+}
+
+// default_section: used for plain key files (weapon overrides), e.g. "WP0F".
+static void parse_weapon_ini(const char* path, const char* default_section)
+{
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || !f) return;
+
+    char current[64];
+    strncpy_s(current, sizeof(current), default_section, _TRUNCATE);
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        trim(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
+
+        if (line[0] == '[') {
+            char* end = strchr(line, ']');
+            if (!end) continue;
+            *end = 0;
+            strncpy_s(current, sizeof(current), line + 1, _TRUNCATE);
+            trim(current);
+            continue;
+        }
+
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char* key = line;
+        char* val = eq + 1;
+        trim(key);
+        trim(val);
+
+        int id = weapon_id_from_name(current);
+        if (id < 0) continue;
+        WeaponCfg& w = g_weapons[id];
+
+        if (_stricmp(key, "pos117") == 0) w.has_pos117 = (unsigned char)parse_vec3(val, w.pos117);
+        else if (_stricmp(key, "rot117") == 0) w.has_rot117 = (unsigned char)parse_vec3(val, w.rot117);
+        else if (_stricmp(key, "pos2") == 0) w.has_pos2 = (unsigned char)parse_vec3(val, w.pos2);
+        else if (_stricmp(key, "rot2") == 0) w.has_rot2 = (unsigned char)parse_vec3(val, w.rot2);
+    }
+    fclose(f);
+}
+
 // ---------------------------------------------------------------- logging
 static void log_line(const char* fmt, ...)
 {
@@ -165,9 +296,14 @@ static BYTE  g_result = 0;
 static BYTE  g_bone_female = 0x02;
 static BYTE  g_bone_male = 0x75;
 
-static const DWORD VA_BONE_FEM  = 0xC4D8B6;
-static const DWORD VA_BONE_MALE = 0xC4D887;
-static const DWORD VA_CODE_PAGE = 0xC4D000;
+// The mounting code is located at runtime by signature: the Enigma-packed
+// retail build shifts the function, so fixed addresses must not be used.
+//   male:   6A 75 50 FF D2 8D 87 D0 00 00 00   (push 117; push eax; call; lea 0xD0)
+//   female: 6A 02 50 FF D2 8D 87 F0 00 00 00   (push 2;   push eax; call; lea 0xF0)
+// The two sites are 0x2F bytes apart. g_bone_* point at the immediate byte.
+static DWORD g_weapon_base    = 0;
+static DWORD g_bone_fem_addr  = 0;
+static DWORD g_bone_male_addr = 0;
 
 // Class resource tables (vtable slot +0xA0) with the class (costume) name.
 struct ClassTable { DWORD va; const char* cls; const char* label; };
@@ -319,43 +455,123 @@ static const char* class_of_player(void* player)
 }
 
 // ---------------------------------------------------------------- bone bytes
-static void write_bone_bytes(int bone)
+static void write_code_byte(DWORD addr, BYTE value)
 {
-    BYTE b = (BYTE)bone;
-    if (g_bone_female == b && g_bone_male == b) return;
-
     DWORD old = 0;
-    if (!VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000,
-                        PAGE_EXECUTE_READWRITE, &old))
-        return;
+    if (!VirtualProtect((void*)addr, 1, PAGE_EXECUTE_READWRITE, &old)) return;
 
     SuspendedThreads st;
     suspend_other_threads(st);
-    if (g_bone_female != b) { *(BYTE*)(g_code + (VA_BONE_FEM - 0x400000)) = b; g_bone_female = b; }
-    if (g_bone_male != b)   { *(BYTE*)(g_code + (VA_BONE_MALE - 0x400000)) = b; g_bone_male = b; }
-    FlushInstructionCache(GetCurrentProcess(), g_code + (VA_CODE_PAGE - 0x400000), 0x1000);
+    *(BYTE*)addr = value;
+    FlushInstructionCache(GetCurrentProcess(), (void*)addr, 1);
     resume_threads(st);
 
-    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, old, &old);
+    VirtualProtect((void*)addr, 1, old, &old);
+}
+
+static void write_bone_bytes(int bone)
+{
+    BYTE b = (BYTE)bone;
+    if (!g_bone_fem_addr && !g_bone_male_addr) {
+        static bool logged = false;
+        if (!logged) { logged = true; log_line("bone: mount sites not found, skipping"); }
+        return;
+    }
+
+    if (g_bone_fem_addr && *(BYTE*)g_bone_fem_addr != b) {
+        log_line("bone: female %p %02x -> %02x", (void*)g_bone_fem_addr,
+                 *(BYTE*)g_bone_fem_addr, b);
+        write_code_byte(g_bone_fem_addr, b);
+    }
+    if (g_bone_male_addr && *(BYTE*)g_bone_male_addr != b) {
+        log_line("bone: male %p %02x -> %02x", (void*)g_bone_male_addr,
+                 *(BYTE*)g_bone_male_addr, b);
+        write_code_byte(g_bone_male_addr, b);
+    }
 }
 
 static void reset_bone_bytes()
 {
-    if (g_bone_female == 0x02 && g_bone_male == 0x75) return;
+    if (g_bone_fem_addr && *(BYTE*)g_bone_fem_addr != 0x02) {
+        log_line("bone: female reset %p %02x -> 02", (void*)g_bone_fem_addr,
+                 *(BYTE*)g_bone_fem_addr);
+        write_code_byte(g_bone_fem_addr, 0x02);
+    }
+    if (g_bone_male_addr && *(BYTE*)g_bone_male_addr != 0x75) {
+        log_line("bone: male reset %p %02x -> 75", (void*)g_bone_male_addr,
+                 *(BYTE*)g_bone_male_addr);
+        write_code_byte(g_bone_male_addr, 0x75);
+    }
+}
 
-    DWORD old = 0;
-    if (!VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000,
-                        PAGE_EXECUTE_READWRITE, &old))
-        return;
+static DWORD find_weapon_table_base(BYTE* fem_site);
+static bool table_looks_valid(DWORD base);
+static DWORD find_table_near(BYTE* fem_site);
 
-    SuspendedThreads st;
-    suspend_other_threads(st);
-    if (g_bone_female != 0x02) { *(BYTE*)(g_code + (VA_BONE_FEM - 0x400000)) = 0x02; g_bone_female = 0x02; }
-    if (g_bone_male != 0x75)   { *(BYTE*)(g_code + (VA_BONE_MALE - 0x400000)) = 0x75; g_bone_male = 0x75; }
-    FlushInstructionCache(GetCurrentProcess(), g_code + (VA_CODE_PAGE - 0x400000), 0x1000);
-    resume_threads(st);
+// The table base is an immediate in the mount function (`add $imm,%edi` or a
+// `lea`), but the exact opcode differs between builds. Scan the function bytes
+// for any dword that points at a valid weapon table.
+static DWORD find_table_near(BYTE* fem_site)
+{
+    BYTE* begin = fem_site - 0x400;
+    for (BYTE* p = begin; p + 4 < fem_site; ++p) {
+        DWORD v = *(DWORD*)p;
+        if (v >= 0x400000 && v < 0x2000000 && table_looks_valid(v))
+            return v;
+    }
+    return 0;
+}
 
-    VirtualProtect(g_code + (VA_CODE_PAGE - 0x400000), 0x1000, old, &old);
+// Locate the two push-imm sites by signature. Male = female - 0x2F.
+static bool find_bone_sites()
+{
+    static const BYTE kFem[11] = { 0x6A,0x02,0x50,0xFF,0xD2,0x8D,0x87,0xF0,0x00,0x00,0x00 };
+    static const BYTE kMale[11] = { 0x6A,0x75,0x50,0xFF,0xD2,0x8D,0x87,0xD0,0x00,0x00,0x00 };
+
+    HANDLE self = GetCurrentProcess();
+    BYTE* addr = (BYTE*)0x10000;
+
+    while ((uintptr_t)addr < 0x7FFF0000) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        BYTE* base = (BYTE*)mbi.BaseAddress;
+        SIZE_T size = mbi.RegionSize;
+
+        bool exec = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        bool guard = (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0;
+
+        if (mbi.State == MEM_COMMIT && exec && !guard) {
+            const SIZE_T CHUNK = 64 * 1024;
+            for (SIZE_T off = 0; off < size; off += CHUNK) {
+                SIZE_T to_read = (size - off < CHUNK) ? (size - off) : CHUNK;
+                PBYTE buf = (PBYTE)malloc(to_read);
+                if (!buf) break;
+                SIZE_T got = 0;
+                if (ReadProcessMemory(self, base + off, buf, to_read, &got) &&
+                    got >= sizeof(kFem)) {
+                    for (SIZE_T i = 0; i + sizeof(kFem) <= got; ++i) {
+                        if (memcmp(buf + i, kFem, sizeof(kFem)) != 0) continue;
+                        BYTE* fem = base + off + i;
+                        BYTE* male = fem - 0x2F;
+                        bool male_ok = memcmp(male, kMale, sizeof(kMale)) == 0;
+                        log_line("bone site: female=%p male=%p (male sig %s)",
+                                 (void*)fem, (void*)male, male_ok ? "ok" : "MISSING");
+                        g_bone_fem_addr = (DWORD)(fem + 1);
+                        if (male_ok) g_bone_male_addr = (DWORD)(male + 1);
+                        g_weapon_base = find_weapon_table_base(fem);
+                        if (!g_weapon_base) g_weapon_base = find_table_near(fem);
+                        log_line("weapon table base: %p", (void*)g_weapon_base);
+                        free(buf);
+                        return male_ok;
+                    }
+                }
+                free(buf);
+            }
+        }
+        addr = base + size;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------- decision
@@ -363,6 +579,9 @@ extern "C" unsigned char decide_c(void* player, unsigned type)
 {
     const char* cls = class_of_player(player);
     Cfg cfg = resolve_cfg(cls);
+
+    // The code may be decrypted only when the mount function is first used.
+    if (cfg.custom && !g_bone_fem_addr) find_bone_sites();
 
     if (cfg.custom && cfg.bone >= 0 && cfg.bone <= 127) write_bone_bytes(cfg.bone);
     else reset_bone_bytes();
@@ -471,7 +690,7 @@ static bool patch_site(BYTE* site)
 static void dir_of_module(HMODULE mod, char* out, size_t out_size)
 {
     char path[MAX_PATH] = { 0 };
-    if (mod && GetModuleFileNameA(mod, path, MAX_PATH)) {
+    if (GetModuleFileNameA(mod, path, MAX_PATH)) {
         strncpy_s(out, out_size, path, _TRUNCATE);
         char* slash = strrchr(out, '\\');
         if (slash) *(slash + 1) = 0;
@@ -527,23 +746,92 @@ static void load_override_folder(const char* dir)
     }
 }
 
-static void write_default_ini(const char* dir)
+static void load_weapon_file(const char* path)
+{
+    if (!path || !*path) return;
+    parse_weapon_ini(path, "");
+    log_line("weapon ini: %s", path);
+}
+
+static void load_weapon_folder(const char* dir)
+{
+    char folder[MAX_PATH];
+    strncpy_s(folder, sizeof(folder), dir, _TRUNCATE);
+    strcat_s(folder, sizeof(folder), "re5_weapon_overrides");
+    CreateDirectoryA(folder, nullptr);
+
+    char mask[MAX_PATH];
+    strncpy_s(mask, sizeof(mask), folder, _TRUNCATE);
+    strcat_s(mask, sizeof(mask), "\\*.ini");
+
+    static char names[64][MAX_PATH];
+    int n = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(mask, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (n >= 64) break;
+            strncpy_s(names[n], MAX_PATH, folder, _TRUNCATE);
+            strcat_s(names[n], MAX_PATH, "\\");
+            strcat_s(names[n], MAX_PATH, fd.cFileName);
+            ++n;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+
+    if (n > 1) qsort(names, n, sizeof(names[0]), cmp_names);
+    for (int i = 0; i < n; ++i) {
+        char base[64] = { 0 };
+        const char* fn = strrchr(names[i], '\\');
+        fn = fn ? fn + 1 : names[i];
+        strncpy_s(base, sizeof(base), fn, _TRUNCATE);
+        char* dot = strrchr(base, '.');
+        if (dot) *dot = 0;
+        parse_weapon_ini(names[i], base);
+        log_line("weapon override: %s -> [%s]", names[i], base);
+    }
+}
+
+static void write_default_settings(const char* dir)
 {
     char path[MAX_PATH];
-    strncpy_s(path, sizeof(path), dir, _TRUNCATE);
-    strcat_s(path, sizeof(path), "re5_char_tweaks.ini");
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    path_join(path, sizeof(path), dir, kCfgSettings);
+    if (file_exists(path)) return;
 
     FILE* f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || !f) return;
     fputs(
-        "; RE5 per-costume tweaks\n"
-        "; Sections are exact class names; keys not set here fall back to [default].\n"
-        "; Overrides: re5_char_overrides\\<class>.ini (e.g. uPl00ChrisCos3.ini)\n"
+        "; re5_char_tweaks - global settings\n"
+        "; All keys are snake_case. A missing key keeps its default.\n"
         ";\n"
-        "; back: -1 vanilla / 0 never / 1 force\n"
+        "; file_overrides: 1 = files from re5_file_overrides\\ override .arc entries\n"
+        "; delay_ms:       wait before patching code (Enigma integrity check)\n"
+        "; dump_weapons:   1 = write %TEMP%\\re5_weapon_offsets.txt with the runtime table\n",
+        f);
+    fputs("\n[settings]\n"
+          "file_overrides=1\n"
+          "delay_ms=10000\n"
+          "dump_weapons=1\n", f);
+    fclose(f);
+}
+
+static void write_default_characters(const char* dir)
+{
+    char path[MAX_PATH];
+    path_join(path, sizeof(path), dir, kCfgCharacters);
+    if (file_exists(path)) return;
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f) return;
+    fputs(
+        "; re5_char_tweaks - character (costume) table\n"
+        "; One section per class; keys not set here fall back to [default].\n"
+        "; Per-mod overrides: re5_char_overrides\\<class>.ini (plain keys, no header).\n"
+        ";\n"
+        "; back:        -1 vanilla / 0 never mount / 1 force mount\n"
         "; custom_bone: 0/1, bone: 0..127\n"
-        "; chn: 0 off / 1 .chn / 2 .ccl / 3 both\n",
+        "; chn:         0 off / 1 .chn / 2 .ccl / 3 both\n",
         f);
     fputs("\n[default]\nback=-1\ncustom_bone=0\nbone=0\nchn=0\n\n", f);
     for (const ClassTable& ct : kClassTables) {
@@ -552,6 +840,570 @@ static void write_default_ini(const char* dir)
                 ct.label, ct.cls, back);
     }
     fclose(f);
+}
+
+// Weapon mount offsets live in a global per-weapon table:
+//   0x11A53F0 + (weaponId & 0xFF) * 0x140
+//   +0xD0 pos vec3 / +0xE0 rot vec3   (joint 117 branch)
+//   +0xF0 pos vec3 / +0x100 rot vec3  (spine branch)
+// Optional dump: [default] dump_weapons=1
+// The mount code computes `table + id*0x140` with `add $imm32,%edi` right
+// before the branch, so the table base can be recovered from the code.
+static DWORD find_weapon_table_base(BYTE* fem_site)
+{
+    BYTE* limit = fem_site - 0x400;
+    for (BYTE* p = fem_site - 6; p >= limit; --p) {
+        if (p[0] == 0x81 && p[1] == 0xC7) { // add edi, imm32
+            DWORD imm = *(DWORD*)(p + 2);
+            if (imm > 0x0F000000 && imm < 0x20000000)
+                return imm;
+        }
+    }
+    return 0;
+}
+
+static bool safe_read(DWORD addr, void* buf, SIZE_T size)
+{
+    if (addr < 0x10000 || addr > 0x7FFF0000) return false;
+    if (size > 0x1000 || addr + size < addr) return false;
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), (LPCVOID)addr, buf, size, &got)
+           && got == size;
+}
+
+static bool table_looks_valid(DWORD base)
+{
+    DWORD nameptr = 0;
+    if (!safe_read(base + 4, &nameptr, sizeof(nameptr))) return false;
+    char s[2] = { 0, 0 };
+    if (!safe_read(nameptr, s, 2)) return false;
+    return s[0] == 'W' && s[1] == 'P';
+}
+
+static bool weapon_table_base(DWORD* out)
+{
+    if (g_weapon_base && table_looks_valid(g_weapon_base)) { *out = g_weapon_base; return true; }
+    if (table_looks_valid(0x11A53F0)) { *out = 0x11A53F0; return true; }
+    return false;
+}
+
+static int apply_weapon_offsets()
+{
+    DWORD base = 0;
+    if (!weapon_table_base(&base)) return 0;
+
+    int applied = 0;
+    for (int id = 0; id < 256; ++id) {
+        WeaponCfg& w = g_weapons[id];
+        if (!(w.has_pos117 || w.has_rot117 || w.has_pos2 || w.has_rot2)) continue;
+
+        DWORD addr = base + (DWORD)id * 0x140;
+        DWORD old = 0;
+        if (!VirtualProtect((void*)addr, 0x140, PAGE_READWRITE, &old)) continue;
+
+        float* p = (float*)addr;
+        if (w.has_pos117) memcpy(&p[0xD0/4], w.pos117, sizeof(w.pos117));
+        if (w.has_rot117) memcpy(&p[0xE0/4], w.rot117, sizeof(w.rot117));
+        if (w.has_pos2)   memcpy(&p[0xF0/4], w.pos2,   sizeof(w.pos2));
+        if (w.has_rot2)   memcpy(&p[0x100/4], w.rot2,  sizeof(w.rot2));
+
+        VirtualProtect((void*)addr, 0x140, old, &old);
+        ++applied;
+    }
+    if (applied) log_line("weapon overrides applied: %d", applied);
+    return applied;
+}
+
+static bool dump_weapon_offsets()
+{
+    if (!g_code) return false;
+
+    DWORD tbl = 0;
+    if (g_weapon_base && table_looks_valid(g_weapon_base)) tbl = g_weapon_base;
+    else if (table_looks_valid(0x11A53F0)) tbl = 0x11A53F0;
+    if (!tbl) {
+        static bool logged = false;
+        if (!logged) { logged = true; log_line("weapon dump: no valid table (candidate %p)", (void*)g_weapon_base); }
+        return false;
+    }
+
+    char path[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("TEMP", path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return false;
+    strcat_s(path, MAX_PATH, "\\re5_weapon_offsets.txt");
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f) return false;
+
+    fprintf(f, "# weapon id, name, pos117, rot117, pos_spine, rot_spine (3 floats each)\n");
+    fprintf(f, "# table base %08X\n", tbl);
+
+    int count = 0;
+    BYTE entry[0x110];
+    for (int id = 0; id < 0x100; ++id) {
+        DWORD addr = tbl + (DWORD)id * 0x140;
+        if (!safe_read(addr, entry, sizeof(entry))) continue;
+
+        DWORD nameptr = *(DWORD*)(entry + 4);
+        char name[64] = { 0 };
+        if (!safe_read(nameptr, name, 48)) continue;
+        if (name[0] != 'W' || name[1] != 'P') continue;
+
+        float* p = (float*)entry;
+        fprintf(f, "%02X %-28.28s  pos117 %8.3f %8.3f %8.3f  rot117 %8.3f %8.3f %8.3f  pos2 %8.3f %8.3f %8.3f  rot2 %8.3f %8.3f %8.3f\n",
+                id, name,
+                p[0xD0/4], p[0xD4/4], p[0xD8/4],
+                p[0xE0/4], p[0xE4/4], p[0xE8/4],
+                p[0xF0/4], p[0xF4/4], p[0xF8/4],
+                p[0x100/4], p[0x104/4], p[0x108/4]);
+        ++count;
+    }
+    fclose(f);
+    log_line("weapon dump: %d entries (base %08X) -> %s", count, tbl, path);
+    return count > 0;
+}
+
+
+// ---------------------------------------------------------------- generic scan
+static BYTE* scan_for_bytes(const BYTE* sig, size_t len)
+{
+    HANDLE self = GetCurrentProcess();
+    BYTE* addr = (BYTE*)0x10000;
+    while ((uintptr_t)addr < 0x7FFF0000) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        BYTE* base = (BYTE*)mbi.BaseAddress;
+        SIZE_T size = mbi.RegionSize;
+        bool exec = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        bool guard = (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0;
+        if (mbi.State == MEM_COMMIT && exec && !guard) {
+            const SIZE_T CHUNK = 64 * 1024;
+            for (SIZE_T off = 0; off < size; off += CHUNK) {
+                SIZE_T to_read = (size - off < CHUNK) ? (size - off) : CHUNK;
+                PBYTE buf = (PBYTE)malloc(to_read);
+                if (!buf) break;
+                SIZE_T got = 0;
+                if (ReadProcessMemory(self, base + off, buf, to_read, &got) && got >= len) {
+                    for (SIZE_T i = 0; i + len <= got; ++i) {
+                        if (memcmp(buf + i, sig, len) == 0) {
+                            free(buf);
+                            return base + off + i;
+                        }
+                    }
+                }
+                free(buf);
+            }
+        }
+        addr = base + size;
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------- file overrides
+//
+// When an .arc is mounted, rArchive::load parses the whole TOC and registers
+// every entry in the sResource hash table (precreate -> registTable). After
+// that sResource::create() finds the entry in the table and never touches the
+// disk, so a loose file could never win by itself.
+//
+// The two detours below make a file from re5_file_overrides win over the arc:
+//
+//   sResource::precreate   - for an entry whose (path, resource type) has a
+//                            matching file, the archive entry is not registered;
+//                            instead the resource is loaded from disk with
+//                            create(dti, path, 1) and that object is returned
+//                            (registered and marked loaded, so the archive
+//                            decoder skips it). Any file size is allowed.
+//   sResource::getFullPath - after the original builds
+//                            "<...>\<path>.<ext>", the path is rewritten to
+//                            <dir of this asi>\re5_file_overrides\<path>.<ext>.
+//
+// The resource type has to be resolved exactly (dti->newInstance()->getExt()),
+// otherwise every resource sharing the base name (pl0000.mod / .mtg / .chn ...)
+// would be rebound, and a missing .chn kills the game with
+// "Failed open file ... pl0000.chn".
+//
+// The hooks are installed after g_delay_ms (10 s by default): the retail exe is
+// protected by Enigma, and patching the code before its integrity check
+// finishes makes the game show "Program integrity check failed" and exit.
+
+struct FileOverride {
+    char base[160];   // lowercase, "pawn\pl\pl00\model\pl0000"
+    char ext[12];     // lowercase, "mod"
+    char file[MAX_PATH];
+};
+
+static FileOverride g_fov[64];
+static int  g_fov_count = 0;
+static char g_fov_dir[MAX_PATH] = { 0 };
+
+static BYTE* g_tramp_create = nullptr;
+static BYTE* g_tramp_precreate = nullptr;
+static BYTE* g_tramp_getfullpath = nullptr;
+
+static void lower_copy(char* dst, size_t dst_size, const char* src)
+{
+    size_t i = 0;
+    for (; src[i] && i + 1 < dst_size; ++i)
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    dst[i] = 0;
+}
+
+static const char* find_override(const char* base, const char* ext)
+{
+    for (int i = 0; i < g_fov_count; ++i)
+        if (strcmp(g_fov[i].base, base) == 0 && strcmp(g_fov[i].ext, ext) == 0)
+            return g_fov[i].file;
+    return nullptr;
+}
+
+static void add_override(const char* full, const char* rel)
+{
+    if (g_fov_count >= (int)(sizeof(g_fov) / sizeof(g_fov[0]))) return;
+
+    const char* dot = strrchr(rel, '.');
+    if (!dot || dot == rel) return;
+    size_t base_len = (size_t)(dot - rel);
+    if (base_len == 0 || base_len >= sizeof(g_fov[0].base)) return;
+
+    FileOverride& o = g_fov[g_fov_count];
+    for (size_t i = 0; i < base_len; ++i)
+        o.base[i] = (char)tolower((unsigned char)rel[i]);
+    o.base[base_len] = 0;
+    lower_copy(o.ext, sizeof(o.ext), dot + 1);
+    strncpy_s(o.file, sizeof(o.file), full, _TRUNCATE);
+    ++g_fov_count;
+    log_line("override file: %s (%s)", rel, o.ext);
+}
+
+static void scan_override_dir(const char* dir, const char* rel, int depth)
+{
+    if (depth > 8 || g_fov_count >= (int)(sizeof(g_fov) / sizeof(g_fov[0]))) return;
+
+    char mask[MAX_PATH];
+    snprintf(mask, sizeof(mask), "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(mask, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (fd.cFileName[0] == '.') continue;
+        char full[MAX_PATH], child[MAX_PATH];
+        snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
+        snprintf(child, sizeof(child), "%s%s%s", rel, rel[0] ? "\\" : "", fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            scan_override_dir(full, child, depth + 1);
+        else
+            add_override(full, child);
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+}
+
+// ---- resource type from the DTI: dti->newInstance() -> cResource::getExt() ----
+extern "C" void* vcall_thiscall0(void* obj, void* fn);
+
+extern "C" __attribute__((naked)) void* vcall_thiscall0(void* obj, void* fn)
+{
+    __asm__ __volatile__(
+        "movl 4(%esp), %ecx\n"
+        "pushl %ebx\n"
+        "movl 12(%esp), %ebx\n"
+        "call *%ebx\n"
+        "popl %ebx\n"
+        "ret\n");
+}
+
+static const char* dti_ext(void* dti)
+{
+    if (!dti) return nullptr;
+    void** vt = *(void***)dti;
+    if (!vt || !vt[1]) return nullptr;
+    // the instance is leaked on purpose: calling the engine destructor while an
+    // archive is being mounted is not worth the risk, and it is a few bytes
+    void* obj = vcall_thiscall0(dti, vt[1]);
+    if (!obj) return nullptr;
+    void** ovt = *(void***)obj;
+    if (!ovt || !ovt[0x18 / 4]) return nullptr;
+    return (const char*)vcall_thiscall0(obj, ovt[0x18 / 4]);
+}
+
+// Called from the precreate stub: does this entry have a matching override file?
+extern "C" int want_override(void* dti, const char* path)
+{
+    if (!g_file_overrides_on || !g_fov_count || !path || !*path) return 0;
+
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(g_fov[0].base)) return 0;
+
+    char base[160];
+    lower_copy(base, sizeof(base), path);
+
+    bool base_found = false;
+    for (int i = 0; i < g_fov_count; ++i)
+        if (strcmp(g_fov[i].base, base) == 0) { base_found = true; break; }
+    if (!base_found) return 0;                    // cheap reject for most entries
+
+    const char* ext = dti_ext(dti);
+    if (!ext || !*ext) return 0;
+
+    char e[12];
+    lower_copy(e, sizeof(e), ext);
+    if (!find_override(base, e)) return 0;
+
+    log_line("override: %s.%s", path, e);
+    return 1;
+}
+
+// Called from the getFullPath stub with "<...>\<path>.<ext>".
+extern "C" void redirect_path(char* dst)
+{
+    if (!g_file_overrides_on || !g_fov_count || !dst) return;
+
+    static const char kTag[] = "nativePC_MT\\";
+    const size_t tag_len = sizeof(kTag) - 1;      // 12
+    const char* tail = nullptr;
+    size_t n = strlen(dst);
+    for (size_t i = 0; i + tag_len <= n; ++i) {
+        if (_strnicmp(dst + i, kTag, tag_len) == 0) { tail = dst + i + tag_len; break; }
+    }
+    if (!tail) {
+        const char* bs = strchr(dst, '\\');
+        if (bs) tail = bs + 1;
+    }
+    if (!tail || !*tail) return;
+
+    const char* dot = strrchr(tail, '.');
+    if (!dot || dot == tail) return;
+    size_t base_len = (size_t)(dot - tail);
+    if (base_len == 0 || base_len >= sizeof(g_fov[0].base)) return;
+
+    char base[160], ext[12];
+    for (size_t i = 0; i < base_len; ++i)
+        base[i] = (char)tolower((unsigned char)tail[i]);
+    base[base_len] = 0;
+    lower_copy(ext, sizeof(ext), dot + 1);
+
+    const char* file = find_override(base, ext);
+    if (!file) return;
+    if (strlen(file) >= 250) return;
+
+    static char last[260] = { 0 };
+    if (strcmp(last, file) != 0) {
+        strncpy_s(last, sizeof(last), file, _TRUNCATE);
+        log_line("override read: %s", file);
+    }
+    strcpy_s(dst, 260, file);
+}
+
+// ---------------------------------------------------------------- stubs
+struct Emit {
+    BYTE* b;
+    size_t n;
+    Emit(BYTE* buf) : b(buf), n(0) {}
+    void u8(int v) { b[n++] = (BYTE)v; }
+    void u32(unsigned v) { memcpy(b + n, &v, 4); n += 4; }
+    void call_rel(void* t) { u8(0xE8); intptr_t r = (BYTE*)t - (b + n + 4); u32((unsigned)r); }
+    void call_ptr(void* pp) { u8(0xFF); u8(0x15); u32((unsigned)(uintptr_t)pp); }
+    void jmp_rel(void* t) { u8(0xE9); intptr_t r = (BYTE*)t - (b + n + 4); u32((unsigned)r); }
+    void mov_eax_esp(int o) { u8(0x8B); u8(0x44); u8(0x24); u8(o); }
+    void mov_ecx_esp(int o) { u8(0x8B); u8(0x4C); u8(0x24); u8(o); }
+    void mov_edx_esp(int o) { u8(0x8B); u8(0x54); u8(0x24); u8(o); }
+    void push_imm8(int v) { u8(0x6A); u8(v); }
+    void add_esp(int v) { u8(0x83); u8(0xC4); u8(v); }
+    void test_eax() { u8(0x85); u8(0xC0); }
+    void popfd_popad() { u8(0x9D); u8(0x61); }
+    void ret_n(int v) { u8(0xC2); u8(v & 0xFF); u8((v >> 8) & 0xFF); }
+    size_t je_placeholder() { u8(0x74); size_t at = n; u8(0x00); return at; }
+    void fix_je(size_t at, size_t target) { b[at] = (BYTE)((int)target - (int)(at + 1)); }
+};
+
+// pushad + pushfd = 0x24 bytes; arguments at [esp+0x28], [esp+0x2C];
+// saved ECX (the DTI) at [esp+0x1C].
+static void build_precreate_stub(BYTE* out, size_t* out_len, void* tramp)
+{
+    Emit e(out);
+    e.u8(0x60); e.u8(0x9C);
+
+    e.mov_eax_esp(0x2C);          // path
+    e.mov_edx_esp(0x1C);          // dti
+    e.u8(0x50);                   // push eax (arg2 = path)
+    e.u8(0x52);                   // push edx (arg1 = dti)
+    e.call_rel((void*)want_override);
+    e.add_esp(8);
+    e.test_eax();
+    size_t je_normal = e.je_placeholder();
+
+    // create(this = sres, dti, path, 1)
+    e.mov_eax_esp(0x2C);          // path
+    e.mov_edx_esp(0x1C);          // dti
+    e.mov_ecx_esp(0x28);          // sres
+    e.push_imm8(1);
+    e.u8(0x50);                   // push eax (path)
+    e.u8(0x52);                   // push edx (dti)
+    e.call_ptr(&g_tramp_create);
+    e.test_eax();
+    size_t je_normal2 = e.je_placeholder();
+
+    // resource must be really loaded (mState & 1), otherwise keep the arc entry
+    e.u8(0xF6); e.u8(0x40); e.u8(0x4C); e.u8(0x01);
+    size_t je_normal3 = e.je_placeholder();
+
+    e.u8(0x81); e.u8(0xC4); e.u32(0x24);   // add esp,0x24 (drop pushad/pushfd)
+    e.ret_n(12);
+
+    size_t normal = e.n;
+    e.fix_je(je_normal, normal);
+    e.fix_je(je_normal2, normal);
+    e.fix_je(je_normal3, normal);
+    e.popfd_popad();
+    e.jmp_rel(tramp);
+
+    *out_len = e.n;
+}
+
+// getFullPath(eax = sResource*, ecx = cResource*, [esp+4] = dst, [esp+8] = flag)
+static void build_getfullpath_stub(BYTE* out, size_t* out_len, void* tramp)
+{
+    Emit e(out);
+    e.u8(0x60); e.u8(0x9C);
+
+    e.mov_eax_esp(0x2C);          // flag
+    e.mov_edx_esp(0x28);          // dst
+    e.u8(0x50);
+    e.u8(0x52);
+    e.mov_eax_esp(0x28);          // sres (0x20 + 8)
+    e.mov_ecx_esp(0x24);          // pr   (0x1C + 8)
+    e.call_ptr(&g_tramp_getfullpath);
+
+    e.mov_eax_esp(0x28);          // dst
+    e.u8(0x50);
+    e.call_rel((void*)redirect_path);
+    e.add_esp(4);
+
+    e.popfd_popad();
+    e.ret_n(8);
+
+    *out_len = e.n;
+}
+
+static BYTE* make_tramp(BYTE* target, size_t patch_len)
+{
+    BYTE* t = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+    if (!t) return nullptr;
+    memcpy(t, target, patch_len);
+    t[patch_len] = 0xE9;
+    *(DWORD*)(t + patch_len + 1) = (DWORD)(target + patch_len) - ((DWORD)(t + patch_len) + 5);
+    return t;
+}
+
+static bool patch_entry(BYTE* target, size_t len, BYTE* stub, const char* what)
+{
+    SuspendedThreads st;
+    suspend_other_threads(st);
+
+    DWORD old = 0;
+    bool ok = VirtualProtect(target, len, PAGE_EXECUTE_READWRITE, &old) != 0;
+    if (ok) {
+        BYTE patch[16];
+        memset(patch, 0x90, sizeof(patch));
+        patch[0] = 0xE9;
+        *(DWORD*)(patch + 1) = (DWORD)stub - ((DWORD)target + 5);
+        memcpy(target, patch, len);
+        FlushInstructionCache(GetCurrentProcess(), target, len);
+        VirtualProtect(target, len, old, &old);
+    }
+    resume_threads(st);
+
+    if (ok) log_line("file overrides: %s hooked at %p", what, (void*)target);
+    else    log_line("file overrides: %s patch failed", what);
+    return ok;
+}
+
+static DWORD WINAPI file_override_thread(LPVOID)
+{
+    if (GetModuleHandleA("re5_loose_loader.asi")) {
+        log_line("file overrides: re5_loose_loader.asi present - skipping (it does the same)");
+        return 0;
+    }
+
+    if (g_delay_ms > 0) {
+        log_line("file overrides: waiting %d ms before patching", g_delay_ms);
+        Sleep((DWORD)g_delay_ms);
+    }
+
+    static const BYTE sig_create[] = {
+        0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x0C, 0x8B, 0x45, 0x08
+    };
+    static const BYTE sig_precreate[] = {
+        0x83, 0xEC, 0x08, 0x53, 0x8B, 0x5C, 0x24, 0x10, 0x55, 0x8B, 0x6C, 0x24, 0x18
+    };
+    static const BYTE sig_getfullpath[] = {
+        0x53, 0x8B, 0x5C, 0x24, 0x08, 0x85, 0xDB, 0x56, 0x8B, 0xF1, 0x74, 0x5D
+    };
+
+    BYTE* p_create = nullptr, *p_pre = nullptr, *p_gfp = nullptr;
+    for (int i = 0; i < 240; ++i) {
+        if (!p_create) p_create = scan_for_bytes(sig_create, sizeof(sig_create));
+        if (!p_pre)    p_pre    = scan_for_bytes(sig_precreate, sizeof(sig_precreate));
+        if (!p_gfp)    p_gfp    = scan_for_bytes(sig_getfullpath, sizeof(sig_getfullpath));
+        if (p_create && p_pre && p_gfp) break;
+        Sleep(250);
+    }
+    if (!p_create || !p_pre || !p_gfp) {
+        log_line("file overrides: signatures not found (create=%p precreate=%p getFullPath=%p)",
+                 (void*)p_create, (void*)p_pre, (void*)p_gfp);
+        return 0;
+    }
+
+    g_tramp_create = make_tramp(p_create, 6);
+    g_tramp_precreate = make_tramp(p_pre, 8);
+    g_tramp_getfullpath = make_tramp(p_gfp, 5);
+    if (!g_tramp_create || !g_tramp_precreate || !g_tramp_getfullpath) {
+        log_line("file overrides: trampoline allocation failed");
+        return 0;
+    }
+
+    BYTE* stub_pre = (BYTE*)VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    BYTE* stub_gfp = (BYTE*)VirtualAlloc(nullptr, 256, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub_pre || !stub_gfp) {
+        log_line("file overrides: stub allocation failed");
+        return 0;
+    }
+
+    size_t len = 0;
+    build_precreate_stub(stub_pre, &len, g_tramp_precreate);
+    build_getfullpath_stub(stub_gfp, &len, g_tramp_getfullpath);
+
+    bool ok_pre = patch_entry(p_pre, 8, stub_pre, "precreate");
+    bool ok_gfp = patch_entry(p_gfp, 5, stub_gfp, "getFullPath");
+    log_line("file overrides: %s (%d file(s))", (ok_pre && ok_gfp) ? "active" : "PARTIAL",
+             g_fov_count);
+    return 0;
+}
+
+static void init_file_overrides(const char* dir, const char* exe_dir)
+{
+    (void)exe_dir;
+    if (!g_file_overrides_on) {
+        log_line("file overrides: disabled by config");
+        return;
+    }
+
+    strncpy_s(g_fov_dir, sizeof(g_fov_dir), dir, _TRUNCATE);
+    strcat_s(g_fov_dir, sizeof(g_fov_dir), "re5_file_overrides");
+    CreateDirectoryA(g_fov_dir, nullptr);
+
+    scan_override_dir(g_fov_dir, "", 0);
+    log_line("file overrides: %d file(s) in %s", g_fov_count, g_fov_dir);
+    if (!g_fov_count) return;
+
+    HANDLE h = CreateThread(nullptr, 0, file_override_thread, nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
 }
 
 static DWORD WINAPI worker(LPVOID)
@@ -570,28 +1422,62 @@ static DWORD WINAPI worker(LPVOID)
     g_code = (BYTE*)GetModuleHandleA(nullptr);
     if (!g_code) return 0;
 
-    char master[MAX_PATH];
-    strncpy_s(master, sizeof(master), dir, _TRUNCATE);
-    strcat_s(master, sizeof(master), "re5_char_tweaks.ini");
-    if (GetFileAttributesA(master) == INVALID_FILE_ATTRIBUTES && exe_dir[0]) {
-        char alt[MAX_PATH];
-        strncpy_s(alt, sizeof(alt), exe_dir, _TRUNCATE);
-        strcat_s(alt, sizeof(alt), "re5_char_tweaks.ini");
-        if (GetFileAttributesA(alt) != INVALID_FILE_ATTRIBUTES)
-            strncpy_s(master, sizeof(master), alt, _TRUNCATE);
-    }
-    if (GetFileAttributesA(master) == INVALID_FILE_ATTRIBUTES)
-        write_default_ini(dir);
+    // The legacy master file (re5_char_tweaks.ini) carries both the global
+    // settings and the character table, so it may be resolved for both slots.
+    char cfg_settings[MAX_PATH] = { 0 }, cfg_chars[MAX_PATH] = { 0 }, cfg_weapons[MAX_PATH] = { 0 };
+    bool has_settings = find_config(cfg_settings, sizeof(cfg_settings), dir, exe_dir,
+                                    kCfgSettings, kCfgLegacyMaster);
+    bool has_chars = find_config(cfg_chars, sizeof(cfg_chars), dir, exe_dir,
+                                 kCfgCharacters, kCfgLegacyMaster);
+    bool has_weapons = find_config(cfg_weapons, sizeof(cfg_weapons), dir, exe_dir,
+                                   kCfgWeapons, kCfgLegacyWeapons);
 
-    parse_ini(master, "default");
-    log_line("start: module=%p ini=%s", (void*)g_code, master);
+    if (!has_settings && !has_chars) {
+        write_default_settings(dir);
+        write_default_characters(dir);
+        has_settings = find_config(cfg_settings, sizeof(cfg_settings), dir, exe_dir,
+                                   kCfgSettings, kCfgLegacyMaster);
+        has_chars = find_config(cfg_chars, sizeof(cfg_chars), dir, exe_dir,
+                                kCfgCharacters, kCfgLegacyMaster);
+    }
+
+    if (has_settings) parse_ini(cfg_settings, "settings");
+    if (has_chars && (!has_settings || _stricmp(cfg_chars, cfg_settings) != 0))
+        parse_ini(cfg_chars, "default");
+
+    init_file_overrides(dir, exe_dir);
+    log_line("start: module=%p", (void*)g_code);
+    log_line("config: settings=%s", has_settings ? cfg_settings : "(none)");
+    log_line("config: characters=%s", has_chars ? cfg_chars : "(none)");
+    log_line("config: weapons=%s", has_weapons ? cfg_weapons : "(none)");
 
     load_override_folder(dir);
+    load_weapon_file(has_weapons ? cfg_weapons : nullptr);
+    load_weapon_folder(dir);
     if (exe_dir[0] && _stricmp(exe_dir, dir) != 0)
         load_override_folder(exe_dir);
 
     g_stub = build_stub();
     if (!g_stub) { log_line("no stub memory"); return 0; }
+
+    // Mount-joint sites: retry until the packed image is decrypted.
+    for (int i = 0; i < 300; ++i) {
+        if (find_bone_sites()) break;
+        Sleep(1000);
+    }
+
+    // Weapon offsets: wait until the table is filled, then write the config.
+    for (int i = 0; i < 60; ++i) {
+        if (apply_weapon_offsets() > 0) break;
+        Sleep(1000);
+    }
+
+    if (g_dump_weapons) {
+        for (int i = 0; i < 60; ++i) {
+            if (dump_weapon_offsets()) break;
+            Sleep(1000);
+        }
+    }
 
     bool patched = false;
     for (int i = 0; i < 1800; ++i) {
