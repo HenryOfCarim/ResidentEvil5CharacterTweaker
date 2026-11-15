@@ -9,9 +9,6 @@
 //   re5_weapon_overrides\   per-mod weapon overrides, <WPxx>.ini
 //   re5_file_overrides\     loose file overrides, <archive-internal path>.<ext>
 //
-// The legacy names re5_char_tweaks.ini and re5_weapon_offsets.ini are still
-// read when the new file is absent, so old installations keep working.
-//
 // Sections in re5_ct_characters.ini are the exact class names (costumes), plus
 // [default]:
 //   [uPl00ChrisCos3]
@@ -19,6 +16,13 @@
 //   custom_bone=1
 //   bone=4
 // A class section overrides [default] key by key.
+//
+// A [WPxx] section inside a class section overrides re5_ct_weapons.ini for that
+// costume only; keys not set fall back to a [WPxx] under [default], then to the
+// value already in the game's per-weapon table:
+//   [uPl00ChrisCos3]
+//   [WP0F]
+//   pos2=-5,7,-13
 //
 // Keys:
 //   back        -1 = vanilla, 0 = never mount, 1 = force mount
@@ -45,8 +49,17 @@
 
 static bool looks_like_model_path(DWORD ptr);
 static BYTE* scan_for_bytes(const BYTE* sig, size_t len);
+static int  weapon_id_from_name(const char* s);
+static void set_char_weapon_key(const char* cls, int id, const char* key, const char* val);
 
 // ---------------------------------------------------------------- config
+// Weapon mount offsets: position/rotation for the joint-117 branch and for the
+// spine branch, the same four vec3s as re5_ct_weapons.ini.
+struct WeaponCfg {
+    float pos117[3], rot117[3], pos2[3], rot2[3];
+    unsigned char has_pos117, has_rot117, has_pos2, has_rot2;
+};
+
 struct Section {
     char name[64];
     int back, custom, bone, chn;
@@ -55,7 +68,7 @@ struct Section {
 
 struct Cfg { int back, custom, bone, chn; };
 
-static int g_dump_weapons = 1;
+static int g_dump_weapons = 0;
 static int g_file_overrides_on = 1;
 static int g_delay_ms = 10000;
 
@@ -91,13 +104,10 @@ static void trim(char* s)
 }
 
 // ---------------------------------------------------------------- config files
-// All lowercase snake_case, one prefix per mod. The legacy names are still
-// accepted when the new file does not exist.
+// All lowercase snake_case, one prefix per mod.
 static const char kCfgSettings[] = "re5_ct_settings.ini";
 static const char kCfgCharacters[] = "re5_ct_characters.ini";
 static const char kCfgWeapons[] = "re5_ct_weapons.ini";
-static const char kCfgLegacyMaster[] = "re5_char_tweaks.ini";
-static const char kCfgLegacyWeapons[] = "re5_weapon_offsets.ini";
 
 static bool file_exists(const char* path)
 {
@@ -110,38 +120,47 @@ static void path_join(char* dst, size_t dst_size, const char* dir, const char* n
     strcat_s(dst, dst_size, name);
 }
 
-// Looks for <dir>\<name>, then <dir>\<legacy>, then the same under exe_dir.
+// Looks for <dir>\<name>, then the same under exe_dir.
 static bool find_config(char* out, size_t out_size, const char* dir,
-                        const char* exe_dir, const char* name, const char* legacy)
+                        const char* exe_dir, const char* name)
 {
     const char* dirs[2] = { dir, exe_dir };
-    const char* names[2] = { name, legacy };
 
     for (int d = 0; d < 2; ++d) {
         if (!dirs[d] || !*dirs[d]) continue;
         if (d == 1 && _stricmp(dirs[0], dirs[1]) == 0) continue;
-        for (int n = 0; n < 2; ++n) {
-            if (!names[n] || !*names[n]) continue;
-            char p[MAX_PATH];
-            path_join(p, sizeof(p), dirs[d], names[n]);
-            if (file_exists(p)) {
-                strncpy_s(out, out_size, p, _TRUNCATE);
-                return true;
-            }
+        char p[MAX_PATH];
+        path_join(p, sizeof(p), dirs[d], name);
+        if (file_exists(p)) {
+            strncpy_s(out, out_size, p, _TRUNCATE);
+            return true;
         }
     }
     return false;
 }
 
 // default_section: used for keys that appear before the first [section] line.
+//
+// A [WPxx] section inside this file belongs to the class section before it (or
+// to default_section at the top of the file), so a costume can carry its own
+// weapon mount offsets next to its back/bone keys:
+//
+//   [uPl00ChrisCos3]
+//   back=0
+//   [WP0F]
+//   pos2=-5,7,-13
 static void parse_ini(const char* path, const char* default_section)
 {
     FILE* f = nullptr;
     if (fopen_s(&f, path, "r") != 0 || !f) return;
 
     char current[64];
+    char owner[64];          // class that owns subsequent [WPxx] sections
     strncpy_s(current, sizeof(current), default_section, _TRUNCATE);
+    strncpy_s(owner, sizeof(owner), default_section, _TRUNCATE);
     ensure_section(current);
+
+    int wp_id = -1;          // >= 0 while inside a [WPxx] subsection
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
@@ -154,7 +173,14 @@ static void parse_ini(const char* path, const char* default_section)
             *end = 0;
             strncpy_s(current, sizeof(current), line + 1, _TRUNCATE);
             trim(current);
-            ensure_section(current);
+            int id = weapon_id_from_name(current);
+            if (id >= 0) {
+                wp_id = id;              // stays inside the current class
+            } else {
+                wp_id = -1;
+                strncpy_s(owner, sizeof(owner), current, _TRUNCATE);
+                ensure_section(current);
+            }
             continue;
         }
 
@@ -165,6 +191,11 @@ static void parse_ini(const char* path, const char* default_section)
         char* val = eq + 1;
         trim(key);
         trim(val);
+
+        if (wp_id >= 0) {
+            set_char_weapon_key(owner, wp_id, key, val);
+            continue;
+        }
 
         Section* s = find_section(current);
         if (!s) continue;
@@ -202,11 +233,6 @@ static Cfg resolve_cfg(const char* cls)
 }
 
 // ---------------------------------------------------------------- weapon offsets
-struct WeaponCfg {
-    float pos117[3], rot117[3], pos2[3], rot2[3];
-    unsigned char has_pos117, has_rot117, has_pos2, has_rot2;
-};
-
 static WeaponCfg g_weapons[256];
 
 static int weapon_id_from_name(const char* s)
@@ -229,6 +255,70 @@ static int parse_vec3(const char* v, float out[3])
         return 1;
     }
     return 0;
+}
+
+// ---------------------------------------------------------------- per-class weapon offsets
+// [WPxx] subsections inside a class section. Values are keyed by
+// (class, weapon) and override re5_ct_weapons.ini for that costume only.
+// A class section only ever matches its exact class name; no character-wide
+// section is supported on purpose, so tuning one costume never changes another.
+// Fallback for one mount, key by key:
+// class -> [default] -> the value already in the game's table.
+struct CharWeapon {
+    char cls[64];
+    int  id;
+    WeaponCfg w;
+};
+
+static CharWeapon g_char_weapons[192];
+static int g_char_weapon_count = 0;
+
+static CharWeapon* find_char_weapon(const char* cls, int id, bool create)
+{
+    for (int i = 0; i < g_char_weapon_count; ++i)
+        if (g_char_weapons[i].id == id && _stricmp(g_char_weapons[i].cls, cls) == 0)
+            return &g_char_weapons[i];
+    if (!create) return nullptr;
+    if (g_char_weapon_count >= (int)(sizeof(g_char_weapons) / sizeof(g_char_weapons[0])))
+        return nullptr;
+    CharWeapon* cw = &g_char_weapons[g_char_weapon_count++];
+    memset(cw, 0, sizeof(*cw));
+    strncpy_s(cw->cls, sizeof(cw->cls), cls, _TRUNCATE);
+    cw->id = id;
+    return cw;
+}
+
+static void set_char_weapon_key(const char* cls, int id, const char* key, const char* val)
+{
+    CharWeapon* cw = find_char_weapon(cls, id, true);
+    if (!cw) return;
+    if (_stricmp(key, "pos117") == 0) cw->w.has_pos117 = (unsigned char)parse_vec3(val, cw->w.pos117);
+    else if (_stricmp(key, "rot117") == 0) cw->w.has_rot117 = (unsigned char)parse_vec3(val, cw->w.rot117);
+    else if (_stricmp(key, "pos2") == 0) cw->w.has_pos2 = (unsigned char)parse_vec3(val, cw->w.pos2);
+    else if (_stricmp(key, "rot2") == 0) cw->w.has_rot2 = (unsigned char)parse_vec3(val, cw->w.rot2);
+}
+
+// Resolution for one mount is key by key: class -> [default] -> the value
+// already in the game's table.
+static bool resolve_char_weapon(const char* cls, int id, WeaponCfg* out)
+{
+    memset(out, 0, sizeof(*out));
+
+    const char* names[2] = { cls, "default" };
+    bool any = false;
+
+    for (int k = 0; k < 2; ++k) {
+        const char* n = names[k];
+        if (!n || !*n) continue;
+        if (k == 1 && _stricmp(names[0], n) == 0) continue;
+        CharWeapon* cw = find_char_weapon(n, id, false);
+        if (!cw) continue;
+        if (cw->w.has_pos117) { memcpy(out->pos117, cw->w.pos117, 12); out->has_pos117 = 1; any = true; }
+        if (cw->w.has_rot117) { memcpy(out->rot117, cw->w.rot117, 12); out->has_rot117 = 1; any = true; }
+        if (cw->w.has_pos2)   { memcpy(out->pos2,   cw->w.pos2,   12); out->has_pos2 = 1;   any = true; }
+        if (cw->w.has_rot2)   { memcpy(out->rot2,   cw->w.rot2,   12); out->has_rot2 = 1;   any = true; }
+    }
+    return any;
 }
 
 // default_section: used for plain key files (weapon overrides), e.g. "WP0F".
@@ -880,16 +970,25 @@ static void write_default_settings(const char* dir)
     if (fopen_s(&f, path, "w") != 0 || !f) return;
     fputs(
         "; re5_char_tweaks - global settings\n"
-        "; All keys are snake_case. A missing key keeps its default.\n"
         ";\n"
-        "; file_overrides: 1 = files from re5_file_overrides\\ override .arc entries\n"
-        "; delay_ms:       wait before patching code (Enigma integrity check)\n"
-        "; dump_weapons:   1 = write %TEMP%\\re5_weapon_offsets.txt with the runtime table\n",
+        "; All keys are snake_case; a missing key keeps its default value.\n"
+        "; Character (costume) table:  re5_ct_characters.ini\n"
+        "; Weapon table:              re5_ct_weapons.ini\n"
+        "; Per-mod overrides:         re5_char_overrides\\, re5_weapon_overrides\\\n"
+        "; Loose file overrides:      re5_file_overrides\\<archive path>.<ext>\n"
+        "\n"
+        "[settings]\n"
+        "; 1 = files from re5_file_overrides\\ override the matching .arc entries,\n"
+        ";     0 = disable the file-override hooks\n"
+        "file_overrides=1\n"
+        "\n"
+        "; how long to wait before patching code (the retail exe is Enigma-protected;\n"
+        "; patching earlier makes the game exit with \"Program integrity check failed\")\n"
+        "delay_ms=10000\n"
+        "\n"
+        "; 1 = write %TEMP%\\re5_weapon_offsets.txt with the runtime weapon table (0 = off)\n"
+        "dump_weapons=0\n",
         f);
-    fputs("\n[settings]\n"
-          "file_overrides=1\n"
-          "delay_ms=10000\n"
-          "dump_weapons=1\n", f);
     fclose(f);
 }
 
@@ -903,18 +1002,41 @@ static void write_default_characters(const char* dir)
     if (fopen_s(&f, path, "w") != 0 || !f) return;
     fputs(
         "; re5_char_tweaks - character (costume) table\n"
-        "; One section per class; keys not set here fall back to [default].\n"
-        "; Per-mod overrides: re5_char_overrides\\<class>.ini (plain keys, no header).\n"
         ";\n"
-        "; back:        -1 vanilla / 0 never mount / 1 force mount\n"
-        "; custom_bone: 0/1, bone: 0..127\n"
-        "; chn:         0 off / 1 .chn / 2 .ccl / 3 both\n",
+        "; Sections are exact class names (costumes), not characters. Every key that is\n"
+        "; not set in a class section falls back to [default].\n"
+        "; Global switches live in re5_ct_settings.ini.\n"
+        ";\n"
+        "; Overrides for mods: put <class>.ini files into re5_char_overrides\\\n"
+        "; (next to the .asi). Example: re5_char_overrides\\uPl00ChrisCos3.ini\n"
+        "; with plain keys (no section header needed):\n"
+        ";     back=0\n"
+        ";     custom_bone=1\n"
+        ";     bone=4\n"
+        ";\n"
+        "; back:         -1 = vanilla, 0 = never mount, 1 = force mount\n"
+        "; custom_bone:  0/1 - use the joint below for the mount\n"
+        "; bone:         0..127 - anim joint No\n"
+        "; chn:          0 = off, 1 = .chn, 2 = .ccl, 3 = both\n"
+        ";\n"
+        "; Per-costume weapon offsets: a [WPxx] section inside a class section overrides\n"
+        "; re5_ct_weapons.ini for that costume only, e.g.\n"
+        ";     [uPl00ChrisCos3]\n"
+        ";     back=0\n"
+        ";     [WP0F]\n"
+        ";     pos2=-5,7,-13\n"
+        "; Keys: pos117 / rot117 / pos2 / rot2 (same as re5_ct_weapons.ini).\n"
+        "; A [WPxx] block is owned by the exact class section above it; there is no\n"
+        "; character-wide section, so one costume's tuning never affects another.\n"
+        ";\n"
+        "\n",
         f);
-    fputs("\n[default]\nback=-1\ncustom_bone=0\nbone=0\nchn=0\n\n", f);
+    fputs("[default]\nback=-1\ncustom_bone=0\nbone=0\nchn=0\n\n", f);
+    // Every costume starts at vanilla behaviour: a shipped framework must not
+    // change the game until a key is edited.
     for (const ClassTable& ct : kClassTables) {
-        int back = (strcmp(ct.cls, "uPl05ExcellaNormal") == 0) ? 1 : -1;
-        fprintf(f, "; %s\n[%s]\nback=%d\ncustom_bone=0\nbone=0\nchn=0\n\n",
-                ct.label, ct.cls, back);
+        fprintf(f, "; %s\n[%s]\nback=-1\ncustom_bone=0\nbone=0\nchn=0\n\n",
+                ct.label, ct.cls);
     }
     fclose(f);
 }
@@ -1038,6 +1160,177 @@ static bool dump_weapon_offsets()
     fclose(f);
     log_line("weapon dump: %d entries (base %08X) -> %s", count, tbl, path);
     return count > 0;
+}
+
+// ---------------------------------------------------------------- per-class mount hook
+//
+// The mount function reads the per-weapon offset block only when it actually
+// mounts the holstered weapon (2018 build 0xC4D700..0xC4D93x):
+//
+//   c4d7f6: cmp  byte [ebp+0xc],1        ; mount enabled?
+//   c4d7fa: jne  0xc4d931
+//   c4d800: mov  eax,[ecx+4]             ; item id      <- hook site
+//   c4d803: mov  edx,eax
+//   c4d805: and  edx,0xff00
+//   c4d80b: cmp  edx,0x100               ; weapon?
+//   ...
+//   c4d81c: lea  edi,[eax+eax*4] ; shl edi,6 ; add edi,0x11a53f0
+//   c4d88b: lea  eax,[edi+0xd0] ; push eax ; call setPosition
+//   c4d899: add  edi,0xe0       ; push edi ; call setRotation
+//
+// At c4d800 `ecx` is the item and `edi` is the item manager of the player
+// (`uPlayer + 0x21A0`, the caller passes exactly that), so both the costume and
+// the weapon id are known there. The 11 bytes of that instruction pair are
+// replaced by a jump to a stub that rewrites the 16 floats at
+// table[id] + 0xD0 for this costume (class -> [default] -> table value), then
+// re-executes the original bytes.
+//
+// The write is per mount call, right before the read, so two costumes with
+// different offsets never see each other's values. The first write for a
+// weapon snapshots the block, so a costume without an override gets the
+// previous values (vanilla, or a global re5_ct_weapons.ini override) back.
+static DWORD g_mount_site = 0;
+static BYTE* g_mount_stub = nullptr;
+
+static unsigned char g_wp_touched[256];      // block snapshotted
+static float g_wp_base[256][16];             // +0xD0 .. +0x10F
+static char  g_wp_last[256][64];             // costume last written
+
+static DWORD find_mount_site(BYTE* fem_site)
+{
+    // 8B 41 04 8B D0 81 E2 00 FF 00 00
+    // mov eax,[ecx+4] / mov edx,eax / and edx,0xFF00
+    static const BYTE pat[11] = {
+        0x8B, 0x41, 0x04, 0x8B, 0xD0, 0x81, 0xE2, 0x00, 0xFF, 0x00, 0x00
+    };
+
+    // Reference build: 0xC4D800 = 0xB5 bytes before the joint-2 push site
+    // (0xC4D8B5), i.e. 0x86 bytes before the joint-117 site (0xC4D886).
+    BYTE* guess = fem_site - 0xB5;
+    if (memcmp(guess, pat, sizeof(pat)) == 0) return (DWORD)guess;
+
+    // Tolerate a small layout change between builds.
+    for (int d = 0x20; d <= 0x300; ++d) {
+        BYTE* p = fem_site - d;
+        if (memcmp(p, pat, sizeof(pat)) == 0) {
+            log_line("mount hook: site at -0x%X from the bone site", d);
+            return (DWORD)p;
+        }
+    }
+    return 0;
+}
+
+extern "C" void mount_apply(void* manager, unsigned item_id);
+
+static BYTE* build_mount_stub(DWORD site)
+{
+    static const BYTE orig[11] = {
+        0x8B, 0x41, 0x04, 0x8B, 0xD0, 0x81, 0xE2, 0x00, 0xFF, 0x00, 0x00
+    };
+    BYTE* s = (BYTE*)VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+    if (!s) return nullptr;
+
+    int i = 0;
+    s[i++] = 0x60;                                   // pushad
+    s[i++] = 0x9C;                                   // pushfd
+    s[i++] = 0x57;                                   // push edi (item manager)
+    s[i++] = 0x8B; s[i++] = 0x41; s[i++] = 0x04;     // mov eax,[ecx+4] (item id)
+    s[i++] = 0x50;                                   // push eax
+    s[i++] = 0xE8;                                   // call mount_apply
+    *(DWORD*)(s + i) = (DWORD)&mount_apply - ((DWORD)s + i + 4); i += 4;
+    s[i++] = 0x83; s[i++] = 0xC4; s[i++] = 0x08;     // add esp,8
+    s[i++] = 0x9D;                                   // popfd
+    s[i++] = 0x61;                                   // popad
+    memcpy(s + i, orig, sizeof(orig)); i += sizeof(orig);
+    s[i++] = 0xE9;                                   // jmp site+11
+    *(DWORD*)(s + i) = (DWORD)(site + 11) - ((DWORD)s + i + 4); i += 4;
+    return s;
+}
+
+static bool install_mount_hook()
+{
+    if (g_mount_site) return true;
+    if (!g_bone_fem_addr) return false;
+
+    BYTE* fem = (BYTE*)g_bone_fem_addr - 1;           // push 2 site
+    DWORD site = find_mount_site(fem);
+    if (!site) {
+        static bool logged = false;
+        if (!logged) { logged = true; log_line("mount hook: site pattern not found near %p", (void*)fem); }
+        return false;
+    }
+
+    BYTE* stub = build_mount_stub(site);
+    if (!stub) { log_line("mount hook: stub allocation failed"); return false; }
+
+    SuspendedThreads st;
+    suspend_other_threads(st);
+
+    DWORD old = 0;
+    bool ok = VirtualProtect((void*)site, 11, PAGE_EXECUTE_READWRITE, &old) != 0;
+    if (ok) {
+        BYTE code[11];
+        memset(code, 0x90, sizeof(code));
+        code[0] = 0xE9;
+        *(DWORD*)(code + 1) = (DWORD)stub - (site + 5);
+        memcpy((void*)site, code, sizeof(code));
+        FlushInstructionCache(GetCurrentProcess(), (void*)site, sizeof(code));
+        VirtualProtect((void*)site, 11, old, &old);
+    }
+
+    resume_threads(st);
+
+    if (!ok) { log_line("mount hook: patch failed at %p", (void*)site); return false; }
+
+    g_mount_site = site;
+    g_mount_stub = stub;
+    log_line("mount hook: %p -> %p", (void*)site, (void*)stub);
+    return true;
+}
+
+// Runs on the game thread with edi = item manager, ecx = item (see above).
+extern "C" void mount_apply(void* manager, unsigned item_id)
+{
+    if (!g_weapon_base || !manager) return;
+    if ((item_id & 0xFF00) != 0x100) return;          // not a weapon
+
+    int id = (int)(item_id & 0xFF);
+    const char* cls = class_of_player((char*)manager - 0x21A0);
+    if (!cls || !*cls) return;
+
+    WeaponCfg w;
+    bool any = resolve_char_weapon(cls, id, &w);
+    if (!any && !g_wp_touched[id]) return;
+
+    DWORD data = g_weapon_base + (DWORD)id * 0x140 + 0xD0;
+    if (!g_wp_touched[id]) {
+        if (!safe_read(data, g_wp_base[id], sizeof(g_wp_base[id]))) return;
+        g_wp_touched[id] = 1;
+    }
+
+    float v[16];
+    memcpy(v, g_wp_base[id], sizeof(v));
+    if (w.has_pos117) memcpy(v + 0,  w.pos117, 12);
+    if (w.has_rot117) memcpy(v + 4,  w.rot117, 12);
+    if (w.has_pos2)   memcpy(v + 8,  w.pos2,   12);
+    if (w.has_rot2)   memcpy(v + 12, w.rot2,   12);
+
+    float cur[16];
+    if (!safe_read(data, cur, sizeof(cur))) return;
+
+    if (memcmp(cur, v, sizeof(v)) != 0) {
+        DWORD old = 0;
+        if (!VirtualProtect((void*)data, sizeof(v), PAGE_READWRITE, &old)) return;
+        memcpy((void*)data, v, sizeof(v));
+        VirtualProtect((void*)data, sizeof(v), old, &old);
+    }
+
+    if (_stricmp(g_wp_last[id], cls) != 0) {
+        strncpy_s(g_wp_last[id], sizeof(g_wp_last[id]), cls, _TRUNCATE);
+        log_line("wp: class=%s id=%02X pos117=%d rot117=%d pos2=%d rot2=%d",
+                 cls, id, w.has_pos117, w.has_rot117, w.has_pos2, w.has_rot2);
+    }
 }
 
 
@@ -1499,28 +1792,20 @@ static DWORD WINAPI worker(LPVOID)
     g_code = (BYTE*)GetModuleHandleA(nullptr);
     if (!g_code) return 0;
 
-    // The legacy master file (re5_char_tweaks.ini) carries both the global
-    // settings and the character table, so it may be resolved for both slots.
     char cfg_settings[MAX_PATH] = { 0 }, cfg_chars[MAX_PATH] = { 0 }, cfg_weapons[MAX_PATH] = { 0 };
-    bool has_settings = find_config(cfg_settings, sizeof(cfg_settings), dir, exe_dir,
-                                    kCfgSettings, kCfgLegacyMaster);
-    bool has_chars = find_config(cfg_chars, sizeof(cfg_chars), dir, exe_dir,
-                                 kCfgCharacters, kCfgLegacyMaster);
-    bool has_weapons = find_config(cfg_weapons, sizeof(cfg_weapons), dir, exe_dir,
-                                   kCfgWeapons, kCfgLegacyWeapons);
+    bool has_settings = find_config(cfg_settings, sizeof(cfg_settings), dir, exe_dir, kCfgSettings);
+    bool has_chars = find_config(cfg_chars, sizeof(cfg_chars), dir, exe_dir, kCfgCharacters);
+    bool has_weapons = find_config(cfg_weapons, sizeof(cfg_weapons), dir, exe_dir, kCfgWeapons);
 
     if (!has_settings && !has_chars) {
         write_default_settings(dir);
         write_default_characters(dir);
-        has_settings = find_config(cfg_settings, sizeof(cfg_settings), dir, exe_dir,
-                                   kCfgSettings, kCfgLegacyMaster);
-        has_chars = find_config(cfg_chars, sizeof(cfg_chars), dir, exe_dir,
-                                kCfgCharacters, kCfgLegacyMaster);
+        has_settings = find_config(cfg_settings, sizeof(cfg_settings), dir, exe_dir, kCfgSettings);
+        has_chars = find_config(cfg_chars, sizeof(cfg_chars), dir, exe_dir, kCfgCharacters);
     }
 
     if (has_settings) parse_ini(cfg_settings, "settings");
-    if (has_chars && (!has_settings || _stricmp(cfg_chars, cfg_settings) != 0))
-        parse_ini(cfg_chars, "default");
+    if (has_chars) parse_ini(cfg_chars, "default");
 
     init_file_overrides(dir, exe_dir);
 
@@ -1532,6 +1817,7 @@ static DWORD WINAPI worker(LPVOID)
     log_line("config: settings=%s", has_settings ? cfg_settings : "(none)");
     log_line("config: characters=%s", has_chars ? cfg_chars : "(none)");
     log_line("config: weapons=%s", has_weapons ? cfg_weapons : "(none)");
+    log_line("config: per-class weapon sections=%d", g_char_weapon_count);
 
     load_override_folder(dir);
     load_weapon_file(has_weapons ? cfg_weapons : nullptr);
@@ -1549,9 +1835,23 @@ static DWORD WINAPI worker(LPVOID)
     }
 
     // Weapon offsets: wait until the table is filled, then write the config.
+    // Break out as soon as the table is ready even if nothing is configured,
+    // so a missing re5_ct_weapons.ini does not delay the later hooks by 60 s.
     for (int i = 0; i < 60; ++i) {
         if (apply_weapon_offsets() > 0) break;
+        DWORD base = 0;
+        if (weapon_table_base(&base)) break;
         Sleep(1000);
+    }
+
+    // Per-costume weapon offsets: rewrite the table entry inside the mount
+    // function (needs the bone sites to locate it). Nothing to do - and no
+    // extra code patch - when no [WPxx] subsection was configured.
+    if (g_char_weapon_count > 0) {
+        for (int i = 0; i < 30; ++i) {
+            if (install_mount_hook()) break;
+            Sleep(1000);
+        }
     }
 
     if (g_dump_weapons) {

@@ -109,6 +109,56 @@ Per-weapon table: base `0x11A53F0`, index `weaponId & 0xFF`, stride `0x140`.
 | `+0xF0` | position (joint 2 branch) |
 | `+0x100` | rotation (joint 2 branch) |
 
+### 1.5 Per-costume overrides
+
+The table is global, so a costume override must be applied right before the
+mount code consumes the entry. The mount function does this (2018 build):
+
+```asm
+c4d7f6: cmp  byte [ebp+0xc],1        ; mount flag
+c4d7fa: jne  0xC4D931                ; -> nothing mounted
+c4d800: mov  eax,[ecx+4]             ; item id         <- patch site (11 bytes)
+c4d803: mov  edx,eax
+c4d805: and  edx,0xFF00
+c4d80b: cmp  edx,0x100               ; weapon item?
+c4d817: and  eax,0xFF
+c4d81c: lea  edi,[eax+eax*4] ; shl edi,6
+c4d822: add  edi,0x11A53F0           ; edi = table entry
+c4d88b: lea  eax,[edi+0xD0] ; push ; call 0x588530   ; setPosition
+c4d899: add  edi,0xE0       ; push ; call 0x48EE00   ; setRotation
+```
+
+At `0xC4D800`:
+
+* `ecx` = the item in slot 16 (`id` at `+4`);
+* `edi` = the item manager, i.e. `uPlayer + 0x21A0` (the caller at `0xB70488`
+  passes exactly that pointer);
+* therefore the costume is `class_of_player(edi - 0x21A0)` and the table entry
+  is `base + (id & 0xFF) * 0x140`.
+
+The mod replaces the 11 bytes `8B 41 04 8B D0 81 E2 00 FF 00 00` with a jump
+to a stub that:
+
+1. saves the registers and flags (`pushad`/`pushfd`), calls
+   `mount_apply(edi, [ecx+4])`;
+2. `mount_apply` resolves the costume, composes the four vec3s
+   (class -> `[default]` -> block value; only the exact class name matches, a
+   character-wide section is deliberately unsupported), and writes them to
+   `table[id] + 0xD0..+0x10B`;
+3. restores the registers, re-executes the original 11 bytes and jumps back to
+   `0xC4D80B`.
+
+The first write for a weapon snapshots the 16 floats at `+0xD0`, so a costume
+that defines nothing for that weapon gets the previous block back (vanilla, or
+a global `re5_ct_weapons.ini` override applied at startup).
+
+The site is located relative to the mount-joint push sites found by signature:
+it is `0xB5` bytes before the `6A 02` (joint 2) site, i.e. `0x86` bytes before
+the `6A 75` (joint 117) site, which is `0x2F` earlier; if the 11-byte pattern is
+not there, a small window in front of the joint-2 site is scanned. The bytes are
+re-executed in the stub, so the patch only moves the entry point and does not
+depend on the surrounding code layout.
+
 ---
 
 ## 2. Class resource tables and `.chn` / `.ccl`

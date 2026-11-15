@@ -1,4 +1,4 @@
-# RE5 Char Tweaker
+# RE5 Char Tweaks
 
 An ASI mod for **Resident Evil 5 (PC)** that adds **per-costume** tweaks:
 
@@ -24,7 +24,8 @@ can ship per-costume override files without touching the master config.
 | Back weapon on/off | `back` | `-1` vanilla, `0` never, `1` force |
 | Custom mount joint | `custom_bone` + `bone` | `0/1`, joint No `0..127` |
 | Chain simulation | `chn` | `0` off, `1` `.chn`, `2` `.ccl`, `3` both |
-| Dump weapon offsets | `dump_weapons` | `1` writes `%TEMP%\re5_weapon_offsets.txt` |
+| Per-costume weapon offsets | `[WPxx]` inside a class section | `pos117` / `rot117` / `pos2` / `rot2` |
+| Dump weapon offsets | `dump_weapons` | `0` off (default), `1` writes `%TEMP%\re5_weapon_offsets.txt` |
 | File overrides | `file_overrides` | `1` on, `0` off (files from `re5_file_overrides\`) |
 
 ---
@@ -65,12 +66,11 @@ can ship per-costume override files without touching the master config.
 8. Launch the game.
 
 If the config files are missing, the mod writes defaults for the settings and
-the character table (all 30 costumes, `uPl05ExcellaNormal` with `back=1`); the
-weapon table is optional and is used only when present. A read-only game folder
-may prevent writing; copy the shipped files instead.
-
-Old installations are still supported: `re5_char_tweaks.ini` and
-`re5_weapon_offsets.ini` are read when the new files are absent.
+the character table — all 30 costumes at vanilla behaviour (`back=-1`,
+`custom_bone=0`, `chn=0`), `dump_weapons=0` — so an untouched installation
+changes nothing in the game. The weapon table is optional and is used only when
+present. A read-only game folder may prevent writing; copy the shipped files
+instead.
 
 ---
 
@@ -82,7 +82,7 @@ the `.asi`:
 | File | Purpose |
 |---|---|
 | `re5_ct_settings.ini` | global switches: `file_overrides`, `delay_ms`, `dump_weapons` |
-| `re5_ct_characters.ini` | one section per **class (costume)** plus `[default]` |
+| `re5_ct_characters.ini` | one section per **class (costume)** plus `[default]`, optional `[WPxx]` subsections |
 | `re5_ct_weapons.ini` | one section per **weapon** (`[WPxx]`), mount offsets |
 
 The three drop-in folders keep their established names, because other mods
@@ -95,7 +95,7 @@ ship files for them: `re5_char_overrides\`, `re5_weapon_overrides\`,
 [settings]
 file_overrides=1   ; 1 = re5_file_overrides\ overrides .arc entries
 delay_ms=10000     ; wait before patching (Enigma integrity check)
-dump_weapons=1     ; write %TEMP%\re5_weapon_offsets.txt
+dump_weapons=0     ; 1 = debug write %TEMP%\re5_weapon_offsets.txt
 ```
 
 `re5_ct_characters.ini` — one section per class plus `[default]`; keys not set
@@ -108,6 +108,7 @@ custom_bone=0
 bone=0
 chn=0
 
+; Excella never gets a back weapon in vanilla (class type 0x500): force one
 [uPl05ExcellaNormal]
 back=1
 
@@ -225,6 +226,11 @@ The mod:
    argument, identifies the class by the model path in slot 0 and writes that
    path into the empty slots, so the loader requests `.chn` / `.ccl` from the
    archive.
+6. per-costume weapon offsets are applied inside the mount function
+   (`0xC4D700`): the 11 bytes at `0xC4D800` that read the holstered item id are
+   redirected to a stub which knows the costume (`edi` = item manager =
+   `uPlayer + 0x21A0`) and the weapon id, rewrites `table[id] + 0xD0..+0x10B`
+   for that costume and then runs the original instructions.
 
 File overrides are a separate pair of detours (details in
 [`docs/TECHNICAL.md`](docs/TECHNICAL.md) §4): `sResource::precreate` is stopped
@@ -250,7 +256,7 @@ after `setParent(model, player, joint)`. The table is zero in the exe file
 (BSS) and is filled at startup by the weapon-parameter constructor
 (`0x7F2DB0`, 144 call sites with hardcoded constants), so it cannot be edited
 through the `.arc` files. To inspect the current values, set
-`dump_weapons=1` in `[default]`; the mod writes
+`dump_weapons=1` in `re5_ct_settings.ini`; the mod writes
 `%TEMP%\re5_weapon_offsets.txt` with every valid entry (id, name, the four
 vec3s).
 
@@ -271,6 +277,9 @@ rot2=-0.838,-1.396,-1.937
 by the spine branch (female rigs). Position is x,y,z in game units, rotation is
 x,y,z in radians.
 
+The shipped values are the game's own defaults (dumped from the runtime
+per-weapon table), so loading the file as-is changes nothing.
+
 Per-mod overrides follow the same pattern as the costumes: a file named after
 the weapon in `re5_weapon_overrides\`, with plain keys:
 
@@ -285,6 +294,46 @@ rot2=-0.838,-1.396,-1.937
 
 Overrides are loaded after the master file, alphabetically; later files win.
 The values are written into the runtime table once the game has filled it.
+
+These values are the baseline for every costume. A costume can override them for
+itself — see the next section. Their values are also what a costume without its
+own override falls back to.
+
+### Per-costume weapon offsets
+
+The per-weapon table is global: by default every costume sees the same offset
+for a given weapon. A costume can override the four vec3s for the weapons it
+uses, so e.g. Sheva Tribal can carry the same shotgun differently from Chris.
+The section goes **inside the class section** of `re5_ct_characters.ini`:
+
+```ini
+[uPl01ShebaCos1]
+back=1
+
+[WP0F]
+pos117=-2.000,3.500,-9.000
+rot117=0.000,0.100,0.000
+```
+
+A `[WPxx]` section belongs to the class section before it (a new class section
+closes it) and takes the same keys as `re5_ct_weapons.ini`: `pos117`, `rot117`,
+`pos2`, `rot2`. Rules:
+
+* only the keys you write are changed; the rest keep their value;
+* a class value beats a `[WPxx]` under `[default]`, which beats the value
+  already in the game's table (vanilla, or a global override from
+  `re5_ct_weapons.ini`);
+* a `[WPxx]` block only ever matches the **exact class** it is attached to —
+  there is no character-wide section, so tuning one costume never changes
+  another (a section named `uPl00` is treated as an ordinary class section);
+* the values are written into the table entry right before the mounting code
+  reads it, so two costumes with different offsets never see each other's
+  values (each mount call gets the offsets of the costume that mounts);
+* the same layout works in a per-mod file:
+  `re5_char_overrides\uPl01ShebaCos1.ini` with a `[WP0F]` header.
+
+To find the weapon id, use the dump (`dump_weapons=1` ->
+`%TEMP%\re5_weapon_offsets.txt`).
 
 ### File overrides (loose files)
 
@@ -390,6 +439,7 @@ chain slots: uPl07RebeccaNormal table=... chn=on ccl=on
 | `done (patched=0)` + `site found` missing | the signature was not found — send the log |
 | `tail mismatch at ...` | the site bytes differ in your build — send the log |
 | `class=` empty / `?` | class identification failed — send the log |
+| `mount hook: site pattern not found` | the mount function differs in your build — per-costume weapon offsets stay off, send the log |
 | `chain slots:` missing for `chn=3` | the table was not ready yet, or the class has no model path |
 
 If the log is missing, check that Ultimate ASI Loader is installed and that the
@@ -406,6 +456,9 @@ If the log is missing, check that Ultimate ASI Loader is installed and that the
 - A foreign `.chn` may not fit the skeleton (`ref_joint_no`).
 - Single-player oriented; co-op with two different costumes/configs is not
   tested.
+- Per-costume weapon offsets are written into the shared per-weapon table right
+  before each mount; anything that reads that table outside the mount path sees
+  the values of the costume that mounted last.
 - Not compatible with other mods that hook the same decision site or patch the
   same resource-table slots.
 - File overrides are keyed by the archive-internal path: costumes stored in
