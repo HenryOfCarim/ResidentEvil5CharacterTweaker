@@ -133,14 +133,34 @@ At `0xC4D800`:
 * `ecx` = the item in slot 16 (`id` at `+4`);
 * `edi` = the item manager, i.e. `uPlayer + 0x21A0` (the caller at `0xB70488`
   passes exactly that pointer);
-* therefore the costume is `class_of_player(edi - 0x21A0)` and the table entry
-  is `base + (id & 0xFF) * 0x140`.
+* the table entry is `base + (id & 0xFF) * 0x140`.
+
+The player is *not* taken from `edi` alone: the mount function resolves it itself
+a few instructions later, and the mod reuses that call so the retail build's
+layout cannot break it:
+
+```asm
+c4d83b: mov  ecx,[esi+0x18]          ; esi = [item+0x2c], coord owner
+c4d846: push 0x11F34F8               ; key (a data address, shifted in retail)
+c4d84b: call 0x61D980                ; -> owner if it owns the key, else 0
+c4d850: test eax,eax / je ...
+c4d875: cmp  byte [eax+0x1AF8],0     ; gender -> joint 117 / 2
+```
+
+`mount_apply` therefore tries, in order:
+
+1. the same lookup on `[[item+0x2C]+0x18]` (target and key are read from the
+   code at install time, so the shifted data address does not matter);
+2. `class_of_player(edi - 0x21A0)`;
+3. the class the decide stub stored last.
+
+The first one that yields a per-costume entry wins.
 
 The mod replaces the 11 bytes `8B 41 04 8B D0 81 E2 00 FF 00 00` with a jump
 to a stub that:
 
 1. saves the registers and flags (`pushad`/`pushfd`), calls
-   `mount_apply(edi, [ecx+4])`;
+   `mount_apply(edi, ecx, [ecx+4])`;
 2. `mount_apply` resolves the costume, composes the four vec3s
    (class -> `[default]` -> block value; only the exact class name matches, a
    character-wide section is deliberately unsupported), and writes them to

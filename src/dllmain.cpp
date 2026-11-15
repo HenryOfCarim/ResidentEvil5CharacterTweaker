@@ -389,6 +389,10 @@ static BYTE  g_result = 0;
 static BYTE  g_bone_female = 0x02;
 static BYTE  g_bone_male = 0x75;
 
+// Last class the decide stub resolved (fallback for the mount hook when the
+// player cannot be derived from the mount call itself).
+static char g_decide_class[64] = { 0 };
+
 // The mounting code is located at runtime by signature: the Enigma-packed
 // retail build shifts the function, so fixed addresses must not be used.
 //   male:   6A 75 50 FF D2 8D 87 D0 00 00 00   (push 117; push eax; call; lea 0xD0)
@@ -745,6 +749,7 @@ static bool find_bone_sites()
 extern "C" unsigned char decide_c(void* player, unsigned type)
 {
     const char* cls = class_of_player(player);
+    if (cls && *cls) strncpy_s(g_decide_class, sizeof(g_decide_class), cls, _TRUNCATE);
     Cfg cfg = resolve_cfg(cls);
 
     // The code may be decrypted only when the mount function is first used.
@@ -1179,11 +1184,22 @@ static bool dump_weapon_offsets()
 //   c4d899: add  edi,0xe0       ; push edi ; call setRotation
 //
 // At c4d800 `ecx` is the item and `edi` is the item manager of the player
-// (`uPlayer + 0x21A0`, the caller passes exactly that), so both the costume and
-// the weapon id are known there. The 11 bytes of that instruction pair are
-// replaced by a jump to a stub that rewrites the 16 floats at
-// table[id] + 0xD0 for this costume (class -> [default] -> table value), then
-// re-executes the original bytes.
+// (`uPlayer + 0x21A0`, the caller passes exactly that). The 11 bytes of that
+// instruction pair are replaced by a jump to a stub that rewrites the 16 floats
+// at table[id] + 0xD0 for this costume (class -> [default] -> table value),
+// then re-executes the original bytes.
+//
+// The player is resolved the same way the mount function itself does it a few
+// instructions later:
+//
+//   c4d83b: mov  ecx,[esi+0x18]          ; esi = [item+0x2c], coord owner
+//   c4d846: push 0x11F34F8               ; key (a data address)
+//   c4d84b: call 0x61D980                ; -> uPlayer*, 0 if not found
+//
+// The key and the call target are read from the code at install time, so the
+// retail build's shifted data address does not matter. If that lookup fails,
+// the item manager (`edi - 0x21A0`) and finally the class the decide stub saw
+// are used.
 //
 // The write is per mount call, right before the read, so two costumes with
 // different offsets never see each other's values. The first write for a
@@ -1195,6 +1211,17 @@ static BYTE* g_mount_stub = nullptr;
 static unsigned char g_wp_touched[256];      // block snapshotted
 static float g_wp_base[256][16];             // +0xD0 .. +0x10F
 static char  g_wp_last[256][64];             // costume last written
+
+static void* g_lookup_fn = nullptr;          // mount function's player lookup
+static DWORD g_lookup_key = 0;
+
+// __thiscall: ecx = owner, one stack argument (the callee pops it).
+static void* lookup_player(void* owner)
+{
+    if (!g_lookup_fn || !owner) return nullptr;
+    typedef void* (__attribute__((thiscall)) *Fn)(void*, void*);
+    return ((Fn)g_lookup_fn)(owner, (void*)g_lookup_key);
+}
 
 static DWORD find_mount_site(BYTE* fem_site)
 {
@@ -1220,7 +1247,7 @@ static DWORD find_mount_site(BYTE* fem_site)
     return 0;
 }
 
-extern "C" void mount_apply(void* manager, unsigned item_id);
+extern "C" void mount_apply(void* manager, void* item, unsigned item_id);
 
 static BYTE* build_mount_stub(DWORD site)
 {
@@ -1234,12 +1261,13 @@ static BYTE* build_mount_stub(DWORD site)
     int i = 0;
     s[i++] = 0x60;                                   // pushad
     s[i++] = 0x9C;                                   // pushfd
-    s[i++] = 0x57;                                   // push edi (item manager)
     s[i++] = 0x8B; s[i++] = 0x41; s[i++] = 0x04;     // mov eax,[ecx+4] (item id)
-    s[i++] = 0x50;                                   // push eax
+    s[i++] = 0x50;                                   // push eax (id)
+    s[i++] = 0x51;                                   // push ecx (item)
+    s[i++] = 0x57;                                   // push edi (item manager)
     s[i++] = 0xE8;                                   // call mount_apply
     *(DWORD*)(s + i) = (DWORD)&mount_apply - ((DWORD)s + i + 4); i += 4;
-    s[i++] = 0x83; s[i++] = 0xC4; s[i++] = 0x08;     // add esp,8
+    s[i++] = 0x83; s[i++] = 0xC4; s[i++] = 0x0C;     // add esp,12
     s[i++] = 0x9D;                                   // popfd
     s[i++] = 0x61;                                   // popad
     memcpy(s + i, orig, sizeof(orig)); i += sizeof(orig);
@@ -1264,6 +1292,19 @@ static bool install_mount_hook()
     BYTE* stub = build_mount_stub(site);
     if (!stub) { log_line("mount hook: stub allocation failed"); return false; }
 
+    // Read the player lookup the mount function itself uses (see the comment
+    // above): push <key> / call <fn> right after the hook site.
+    BYTE* push_key = (BYTE*)site + 0x46;
+    BYTE* call_rel = (BYTE*)site + 0x4B;
+    if (push_key[0] == 0x68 && call_rel[0] == 0xE8) {
+        g_lookup_key = *(DWORD*)(push_key + 1);
+        int rel = *(int*)(call_rel + 1);
+        g_lookup_fn = (void*)(call_rel + 5 + rel);
+    } else {
+        log_line("mount hook: player lookup pattern missing (push=%02X call=%02X)",
+                 push_key[0], call_rel[0]);
+    }
+
     SuspendedThreads st;
     suspend_other_threads(st);
 
@@ -1285,22 +1326,53 @@ static bool install_mount_hook()
 
     g_mount_site = site;
     g_mount_stub = stub;
-    log_line("mount hook: %p -> %p", (void*)site, (void*)stub);
+    log_line("mount hook: %p -> %p (lookup %p key %08X)", (void*)site, (void*)stub,
+             g_lookup_fn, g_lookup_key);
     return true;
 }
 
-// Runs on the game thread with edi = item manager, ecx = item (see above).
-extern "C" void mount_apply(void* manager, unsigned item_id)
+// Runs on the game thread with ecx = item, edi = item manager (see above).
+extern "C" void mount_apply(void* manager, void* item, unsigned item_id)
 {
+    static int dbg = 0;
+    if (dbg < 24) {
+        ++dbg;
+        log_line("wp call: item=%04X mgr=%p item=%p", item_id, manager, item);
+    }
+
     if (!g_weapon_base || !manager) return;
     if ((item_id & 0xFF00) != 0x100) return;          // not a weapon
 
     int id = (int)(item_id & 0xFF);
-    const char* cls = class_of_player((char*)manager - 0x21A0);
-    if (!cls || !*cls) return;
+
+    // Player of the weapon being mounted. The mount function resolves it a few
+    // instructions later with a lookup on the coord owner; do the same first,
+    // then fall back to the item manager pointer and finally to the class the
+    // decide stub saw, so a layout difference in the retail build cannot
+    // silently disable the feature.
+    void* player = nullptr;
+    if (item && g_lookup_fn) {
+        void* wc = *(void**)((char*)item + 0x2C);
+        if (wc) player = lookup_player(*(void**)((char*)wc + 0x18));
+    }
 
     WeaponCfg w;
-    bool any = resolve_char_weapon(cls, id, &w);
+    const char* cls = nullptr;
+    bool any = false;
+
+    if (player) {
+        const char* c = class_of_player(player);
+        if (c && *c && resolve_char_weapon(c, id, &w)) { any = true; cls = c; }
+    }
+    if (!any) {
+        const char* c = class_of_player((char*)manager - 0x21A0);
+        if (c && *c && resolve_char_weapon(c, id, &w)) { any = true; cls = c; }
+    }
+    if (!any && g_decide_class[0] && resolve_char_weapon(g_decide_class, id, &w)) {
+        any = true;
+        cls = g_decide_class;
+    }
+
     if (!any && !g_wp_touched[id]) return;
 
     DWORD data = g_weapon_base + (DWORD)id * 0x140 + 0xD0;
@@ -1326,7 +1398,7 @@ extern "C" void mount_apply(void* manager, unsigned item_id)
         VirtualProtect((void*)data, sizeof(v), old, &old);
     }
 
-    if (_stricmp(g_wp_last[id], cls) != 0) {
+    if (cls && _stricmp(g_wp_last[id], cls) != 0) {
         strncpy_s(g_wp_last[id], sizeof(g_wp_last[id]), cls, _TRUNCATE);
         log_line("wp: class=%s id=%02X pos117=%d rot117=%d pos2=%d rot2=%d",
                  cls, id, w.has_pos117, w.has_rot117, w.has_pos2, w.has_rot2);

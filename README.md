@@ -95,7 +95,7 @@ ship files for them: `re5_char_overrides\`, `re5_weapon_overrides\`,
 [settings]
 file_overrides=1   ; 1 = re5_file_overrides\ overrides .arc entries
 delay_ms=10000     ; wait before patching (Enigma integrity check)
-dump_weapons=0     ; 1 = debug write %TEMP%\re5_weapon_offsets.txt
+dump_weapons=0     ; 1 = write %TEMP%\re5_weapon_offsets.txt
 ```
 
 `re5_ct_characters.ini` — one section per class plus `[default]`; keys not set
@@ -228,9 +228,10 @@ The mod:
    archive.
 6. per-costume weapon offsets are applied inside the mount function
    (`0xC4D700`): the 11 bytes at `0xC4D800` that read the holstered item id are
-   redirected to a stub which knows the costume (`edi` = item manager =
-   `uPlayer + 0x21A0`) and the weapon id, rewrites `table[id] + 0xD0..+0x10B`
-   for that costume and then runs the original instructions.
+   redirected to a stub which gets the item (`ecx`), its owner via the same
+   player lookup the mount function uses, the weapon id and the item manager
+   (`edi` = `uPlayer + 0x21A0`), rewrites `table[id] + 0xD0..+0x10B` for that
+   costume and then runs the original instructions.
 
 File overrides are a separate pair of detours (details in
 [`docs/TECHNICAL.md`](docs/TECHNICAL.md) §4): `sResource::precreate` is stopped
