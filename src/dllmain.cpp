@@ -27,7 +27,7 @@
 // Keys:
 //   back        -1 = vanilla, 0 = never mount, 1 = force mount
 //   custom_bone  0/1
-//   bone         0..127 (anim joint No)
+//   bone         0..255 (anim joint No)
 //   chn          0 off, 1 .chn, 2 .ccl, 3 both
 //
 // The decision site is located at runtime by signature (the retail exe is
@@ -51,6 +51,7 @@ static bool looks_like_model_path(DWORD ptr);
 static BYTE* scan_for_bytes(const BYTE* sig, size_t len);
 static int  weapon_id_from_name(const char* s);
 static void set_char_weapon_key(const char* cls, int id, const char* key, const char* val);
+static void add_extra_exts(const char* list);
 
 // ---------------------------------------------------------------- config
 // Weapon mount offsets: position/rotation for the joint-117 branch and for the
@@ -70,6 +71,7 @@ struct Cfg { int back, custom, bone, chn; };
 
 static int g_dump_weapons = 0;
 static int g_file_overrides_on = 1;
+static int g_override_whitelist = 1;   // 1 = index only resource types the game loads
 static int g_delay_ms = 10000;
 
 static Section g_sections[128];
@@ -202,6 +204,8 @@ static void parse_ini(const char* path, const char* default_section)
 
         if (_stricmp(key, "dump_weapons") == 0) { g_dump_weapons = atoi(val); }
         else if (_stricmp(key, "file_overrides") == 0) { g_file_overrides_on = atoi(val); }
+        else if (_stricmp(key, "file_override_whitelist") == 0) { g_override_whitelist = atoi(val); }
+        else if (_stricmp(key, "file_override_exts") == 0) { add_extra_exts(val); }
         else if (_stricmp(key, "delay_ms") == 0) { g_delay_ms = atoi(val); }
         else if (_stricmp(key, "back") == 0) { s->back = atoi(val); s->has_back = 1; }
         else if (_stricmp(key, "custom_bone") == 0) { s->custom = atoi(val); s->has_custom = 1; }
@@ -228,7 +232,7 @@ static Cfg resolve_cfg(const char* cls)
     if (a && a->has_chn) r.chn = a->chn; else if (d && d->has_chn) r.chn = d->chn;
 
     if (r.back < -1) r.back = -1;
-    if (r.bone < 0 || r.bone > 127) r.bone = 0;
+    if (r.bone < 0 || r.bone > 255) r.bone = 0;
     return r;
 }
 
@@ -640,6 +644,87 @@ static void write_code_byte(DWORD addr, BYTE value)
     VirtualProtect((void*)addr, 1, old, &old);
 }
 
+// Single-byte patch for the mount joints: a byte store is atomic, so the
+// suspend-every-thread dance is unnecessary and much more expensive. These
+// bytes are rewritten whenever the costume changes, and (with a trainer
+// running) possibly on every frame - keep it cheap.
+static void write_code_byte_fast(DWORD addr, BYTE value)
+{
+    DWORD old = 0;
+    if (!VirtualProtect((void*)addr, 1, PAGE_EXECUTE_READWRITE, &old)) return;
+    *(BYTE*)addr = value;
+    FlushInstructionCache(GetCurrentProcess(), (void*)addr, 1);
+    VirtualProtect((void*)addr, 1, old, &old);
+}
+
+// ---------------------------------------------------------------- write guards
+//
+// decide_c() runs for every player, every frame. Two things used to happen in
+// that hot path and are now rate-limited, because a second tool in the process
+// (the Ultimate Trainer, or just co-op with two different costumes) can make
+// them permanent:
+//
+//  * site discovery - a full address-space scan whenever the mount signature
+//    was not found yet. If another tool patched those bytes, the signature
+//    never matched and the scan ran 60x/s -> stutter.
+//  * joint byte writes - if something else restores the byte between calls we
+//    end up rewriting it forever, each write with all threads suspended.
+static DWORD g_bone_scan_next = 0;
+static int   g_bone_scan_tries = 0;
+static bool  g_bone_scan_gave_up = false;
+
+static DWORD g_bone_write_tick = 0;
+static int   g_bone_write_burst = 0;
+static bool  g_bone_write_locked = false;
+
+// One discovery attempt per 2 s, at most 20 attempts, then stop for good.
+static bool bone_scan_due()
+{
+    if (g_bone_fem_addr || g_bone_scan_gave_up) return false;
+
+    DWORD now = GetTickCount();
+    if (now < g_bone_scan_next) return false;
+    g_bone_scan_next = now + 2000;
+
+    if (++g_bone_scan_tries > 20) {
+        g_bone_scan_gave_up = true;
+        log_line("bone: mount sites not found after %d tries - custom bone disabled "
+                 "(another mod/trainer patched them?)", g_bone_scan_tries - 1);
+        return false;
+    }
+    return true;
+}
+
+// Allow at most 8 writes per 250 ms window. Hitting the limit means the byte is
+// being changed back by someone else, so keep the vanilla value and stop.
+static bool bone_write_allowed()
+{
+    if (g_bone_write_locked) return false;
+
+    DWORD now = GetTickCount();
+    if (g_bone_write_tick && now - g_bone_write_tick < 250) ++g_bone_write_burst;
+    else g_bone_write_burst = 1;
+    g_bone_write_tick = now;
+
+    if (g_bone_write_burst > 8) {
+        g_bone_write_locked = true;
+        log_line("bone: another writer keeps changing the mount site - "
+                 "custom bone disabled for this session");
+        return false;
+    }
+    return true;
+}
+
+static void set_bone_encoding(int bone);
+
+// Any costume asking for a joint id that does not fit a sign-extended byte?
+static bool any_wide_bone()
+{
+    for (int i = 0; i < g_section_count; ++i)
+        if (g_sections[i].has_bone && g_sections[i].bone > 127) return true;
+    return false;
+}
+
 static void write_bone_bytes(int bone)
 {
     BYTE b = (BYTE)bone;
@@ -649,32 +734,145 @@ static void write_bone_bytes(int bone)
         return;
     }
 
-    if (g_bone_fem_addr && *(BYTE*)g_bone_fem_addr != b) {
+    // 0..255 are valid anim-joint ids. The site holds a sign-extended byte, so
+    // the value goes in as-is and the joint-getter thunk translates it back
+    // (set_bone_encoding); ids 0..127 need no translation.
+    set_bone_encoding(bone);
+
+    bool fem_diff = g_bone_fem_addr && *(BYTE*)g_bone_fem_addr != b;
+    bool male_diff = g_bone_male_addr && *(BYTE*)g_bone_male_addr != b;
+    if (!fem_diff && !male_diff) return;
+    if (!bone_write_allowed()) return;
+
+    if (fem_diff) {
         log_line("bone: female %p %02x -> %02x", (void*)g_bone_fem_addr,
                  *(BYTE*)g_bone_fem_addr, b);
-        write_code_byte(g_bone_fem_addr, b);
+        write_code_byte_fast(g_bone_fem_addr, b);
     }
-    if (g_bone_male_addr && *(BYTE*)g_bone_male_addr != b) {
+    if (male_diff) {
         log_line("bone: male %p %02x -> %02x", (void*)g_bone_male_addr,
                  *(BYTE*)g_bone_male_addr, b);
-        write_code_byte(g_bone_male_addr, b);
+        write_code_byte_fast(g_bone_male_addr, b);
     }
 }
 
 static void reset_bone_bytes()
 {
-    if (g_bone_fem_addr && *(BYTE*)g_bone_fem_addr != 0x02) {
+    set_bone_encoding(-1);
+
+    bool fem_diff = g_bone_fem_addr && *(BYTE*)g_bone_fem_addr != 0x02;
+    bool male_diff = g_bone_male_addr && *(BYTE*)g_bone_male_addr != 0x75;
+    if (!fem_diff && !male_diff) return;
+    if (!bone_write_allowed()) return;
+
+    if (fem_diff) {
         log_line("bone: female reset %p %02x -> 02", (void*)g_bone_fem_addr,
                  *(BYTE*)g_bone_fem_addr);
-        write_code_byte(g_bone_fem_addr, 0x02);
+        write_code_byte_fast(g_bone_fem_addr, 0x02);
     }
-    if (g_bone_male_addr && *(BYTE*)g_bone_male_addr != 0x75) {
+    if (male_diff) {
         log_line("bone: male reset %p %02x -> 75", (void*)g_bone_male_addr,
                  *(BYTE*)g_bone_male_addr);
-        write_code_byte(g_bone_male_addr, 0x75);
+        write_code_byte_fast(g_bone_male_addr, 0x75);
     }
 }
 
+
+// ---------------------------------------------------------------- wide bone ids
+//
+// 0..255 are valid anim-joint ids, but the vanilla site is `push imm8`, which
+// sign-extends: an id above 127 arrives at the engine as a negative number and
+// the joint lookup misses (the weapon is drawn at the world origin).
+//
+// Instead of owning those 5 bytes (another tool in the process may rewrite
+// them, and a torn instruction crashes the game), the id is delivered through
+// the joint getter: the mount call is `[actor]->vtbl[0x34](x, joint)`, so that
+// one vtable slot is redirected to a thunk that translates the encoded negative
+// byte into the real id. The mount code itself stays vanilla; if anything else
+// overwrites our byte - or the slot - the thunk simply does not match and the
+// game behaves as if the feature were off.
+static void* g_bone_orig_joint = nullptr;   // original vtbl[0x34]
+static void** g_bone_slot = nullptr;        // &vtbl[0x34]
+static int   g_bone_enc = 0x7FFFFFFF;       // encoded (sign-extended) byte
+static int   g_bone_val = -1;               // id to deliver instead
+static BYTE* g_bone_thunk = nullptr;        // generated translator
+
+// Generated machine code (no inline asm, so no symbol/linkage surprises):
+//   mov  edx, [esp+8]        ; joint argument
+//   cmp  edx, [g_bone_enc]
+//   jne  pass
+//   mov  edx, [g_bone_val]
+//   mov  [esp+8], edx
+// pass:
+//   jmp  dword ptr [g_bone_orig_joint]
+static BYTE* build_bone_thunk()
+{
+    BYTE* s = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+    if (!s) return nullptr;
+    size_t i = 0;
+    s[i++] = 0x8B; s[i++] = 0x54; s[i++] = 0x24; s[i++] = 0x08;     // mov edx,[esp+8]
+    s[i++] = 0x3B; s[i++] = 0x15;                                   // cmp edx,[imm32]
+    *(DWORD*)(s + i) = (DWORD)&g_bone_enc; i += 4;
+    s[i++] = 0x75;                                                  // jne rel8
+    size_t jne_at = i;
+    s[i++] = 0x00;
+    s[i++] = 0x8B; s[i++] = 0x15;                                   // mov edx,[imm32]
+    *(DWORD*)(s + i) = (DWORD)&g_bone_val; i += 4;
+    s[i++] = 0x89; s[i++] = 0x54; s[i++] = 0x24; s[i++] = 0x08;     // mov [esp+8],edx
+    s[jne_at] = (BYTE)(i - (jne_at + 1));
+    s[i++] = 0xFF; s[i++] = 0x25;                                   // jmp [imm32]
+    *(DWORD*)(s + i) = (DWORD)&g_bone_orig_joint; i += 4;
+    return s;
+}
+
+static void set_bone_encoding(int bone)
+{
+    // 128..254 arrive as a sign-extended byte, which is why the thunk maps them
+    // back. 255 is excluded on purpose: its byte is 0xFF, i.e. -1 - the same
+    // value vanilla code passes for "no joint" - so translating it would hijack
+    // every "none" call instead of adding anything.
+    if (bone > 127 && bone < 255) {
+        g_bone_val = bone;
+        g_bone_enc = (int)(signed char)(BYTE)bone;
+    } else {
+        g_bone_val = -1;
+        g_bone_enc = 0x7FFFFFFF;            // cannot match any real argument
+    }
+}
+
+// Called from the mount hook (ecx = item) before the joint push happens.
+// Validates every pointer: a wrong vtable slot would corrupt unrelated calls.
+static void install_bone_slot_hook(void* item)
+{
+    if (g_bone_slot || !item) return;
+
+    BYTE* p = (BYTE*)item;
+    void* actor = *(void**)(p + 0x2C);
+    if (!actor || (uintptr_t)actor < 0x400000 || (uintptr_t)actor > 0x20000000) return;
+
+    void** vt = *(void***)actor;
+    if (!vt || (uintptr_t)vt < 0x400000 || (uintptr_t)vt > 0x20000000) return;
+
+    void** slot = &vt[0x34 / 4];
+    void* orig = *slot;
+    if (!orig || (uintptr_t)orig < 0x400000 || (uintptr_t)orig > 0x20000000) return;
+
+    if (!g_bone_thunk) g_bone_thunk = build_bone_thunk();
+    if (!g_bone_thunk) return;
+
+    DWORD old = 0;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+        log_line("bone: cannot hook the joint getter (slot %p)", (void*)slot);
+        return;
+    }
+    g_bone_orig_joint = orig;
+    *slot = (void*)g_bone_thunk;
+    VirtualProtect(slot, sizeof(void*), old, &old);
+
+    g_bone_slot = slot;
+    log_line("bone: joint getter hooked at slot %p (was %p)", (void*)slot, orig);
+}
 static DWORD find_weapon_table_base(BYTE* fem_site);
 static bool table_looks_valid(DWORD base);
 static DWORD find_table_near(BYTE* fem_site);
@@ -694,15 +892,16 @@ static DWORD find_table_near(BYTE* fem_site)
 }
 
 // Locate the two push-imm sites by signature. Male = female - 0x2F.
-static bool find_bone_sites()
+// Scans [lo, hi) of the address space; stops at the first hit.
+static bool scan_bone_sites(BYTE* lo, BYTE* hi)
 {
     static const BYTE kFem[11] = { 0x6A,0x02,0x50,0xFF,0xD2,0x8D,0x87,0xF0,0x00,0x00,0x00 };
     static const BYTE kMale[11] = { 0x6A,0x75,0x50,0xFF,0xD2,0x8D,0x87,0xD0,0x00,0x00,0x00 };
 
     HANDLE self = GetCurrentProcess();
-    BYTE* addr = (BYTE*)0x10000;
+    BYTE* addr = lo;
 
-    while ((uintptr_t)addr < 0x7FFF0000) {
+    while ((uintptr_t)addr < (uintptr_t)hi) {
         MEMORY_BASIC_INFORMATION mbi;
         if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
         BYTE* base = (BYTE*)mbi.BaseAddress;
@@ -745,6 +944,25 @@ static bool find_bone_sites()
     return false;
 }
 
+// The mount code lives in re5dx9.exe, so try its image first: that is a few MB
+// instead of every executable region of the process. The full-space scan stays
+// as a fallback (the retail build is Enigma-packed, so the code can also show
+// up in a section that is mapped later).
+static bool find_bone_sites()
+{
+    HMODULE mod = GetModuleHandleA(nullptr);
+    if (mod) {
+        IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)mod;
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+            IMAGE_NT_HEADERS32* nt = (IMAGE_NT_HEADERS32*)((BYTE*)mod + dos->e_lfanew);
+            if (nt->Signature == IMAGE_NT_SIGNATURE &&
+                scan_bone_sites((BYTE*)mod, (BYTE*)mod + nt->OptionalHeader.SizeOfImage))
+                return true;
+        }
+    }
+    return scan_bone_sites((BYTE*)0x10000, (BYTE*)0x7FFF0000);
+}
+
 // ---------------------------------------------------------------- decision
 extern "C" unsigned char decide_c(void* player, unsigned type)
 {
@@ -753,9 +971,10 @@ extern "C" unsigned char decide_c(void* player, unsigned type)
     Cfg cfg = resolve_cfg(cls);
 
     // The code may be decrypted only when the mount function is first used.
-    if (cfg.custom && !g_bone_fem_addr) find_bone_sites();
+    // Rate-limited: this runs in the per-frame decision path.
+    if (cfg.custom && bone_scan_due()) find_bone_sites();
 
-    if (cfg.custom && cfg.bone >= 0 && cfg.bone <= 127) write_bone_bytes(cfg.bone);
+    if (cfg.custom && cfg.bone >= 0 && cfg.bone <= 255) write_bone_bytes(cfg.bone);
     else reset_bone_bytes();
 
     static char last[64] = { 0 };
@@ -987,10 +1206,18 @@ static void write_default_settings(const char* dir)
         ";     0 = disable the file-override hooks\n"
         "file_overrides=1\n"
         "\n"
+        "; 1 = only resource types the game can load are indexed (mod, mtg, tex,\n"
+        ";     lmt, chn, ccl, efl, ...); previews, backups and source files are\n"
+        ";     skipped and listed in the log. 0 = index every file.\n"
+        "file_override_whitelist=1\n"
+        "\n"
+        "; extra extensions to accept, comma separated (e.g. \"abc,def\")\n"
+        "file_override_exts=\n"
+        "\n"
         "; how long to wait before patching code (the retail exe is Enigma-protected;\n"
         "; patching earlier makes the game exit with \"Program integrity check failed\")\n"
         "delay_ms=10000\n"
-        "\n"
+        "\n"        "\n"
         "; 1 = write %TEMP%\\re5_weapon_offsets.txt with the runtime weapon table (0 = off)\n"
         "dump_weapons=0\n",
         f);
@@ -1021,7 +1248,7 @@ static void write_default_characters(const char* dir)
         ";\n"
         "; back:         -1 = vanilla, 0 = never mount, 1 = force mount\n"
         "; custom_bone:  0/1 - use the joint below for the mount\n"
-        "; bone:         0..127 - anim joint No\n"
+        "; bone:         0..255 - anim joint No\n"
         "; chn:          0 = off, 1 = .chn, 2 = .ccl, 3 = both\n"
         ";\n"
         "; Per-costume weapon offsets: a [WPxx] section inside a class section overrides\n"
@@ -1334,6 +1561,10 @@ static bool install_mount_hook()
 // Runs on the game thread with ecx = item, edi = item manager (see above).
 extern "C" void mount_apply(void* manager, void* item, unsigned item_id)
 {
+    // Before the mount function pushes the joint id: make sure the joint getter
+    // can deliver ids above 127 (it only sees a sign-extended byte).
+    install_bone_slot_hook(item);
+
     static int dbg = 0;
     if (dbg < 24) {
         ++dbg;
@@ -1470,19 +1701,110 @@ static BYTE* scan_for_bytes(const BYTE* sig, size_t len)
 // protected by Enigma, and patching the code before its integrity check
 // finishes makes the game show "Program integrity check failed" and exit.
 
+#define FOV_MAX 256           // loose files indexed at startup
+
+static BYTE* g_tramp_create = nullptr;
+static BYTE* g_tramp_precreate = nullptr;
+static BYTE* g_tramp_getfullpath = nullptr;
+
 struct FileOverride {
     char base[160];   // lowercase, "pawn\pl\pl00\model\pl0000"
     char ext[12];     // lowercase, "mod"
     char file[MAX_PATH];
 };
 
-static FileOverride g_fov[64];
+static FileOverride g_fov[FOV_MAX];
 static int  g_fov_count = 0;
+static int  g_fov_skipped = 0;   // rejected by the type whitelist
+static int  g_fov_dropped = 0;   // did not fit into g_fov
 static char g_fov_dir[MAX_PATH] = { 0 };
 
-static BYTE* g_tramp_create = nullptr;
-static BYTE* g_tramp_precreate = nullptr;
-static BYTE* g_tramp_getfullpath = nullptr;
+static const int kSkipLogLines = 64;   // per-file "skip" log lines, then summary only
+
+// Resource types RE5 registers in a .arc TOC, i.e. what cResource::getExt()
+// returns for the classes the engine instantiates. This is the game's own
+// (type id -> extension -> class) table, so a file with any other extension is
+// never requested by the engine: indexing it would only burn one of the
+// FOV_MAX slots - and previews, backups and source files would push real
+// overrides out of the table. Anything missing here can be added with
+// file_override_exts= in re5_ct_settings.ini; file_override_whitelist=0
+// restores the old "index every file" behaviour.
+//
+//   ext   class
+struct ResType { const char* ext; const char* cls; };
+
+static const ResType kResTypes[] = {
+    { "ccl",  "rChainCol" },              { "lom",  "rLotSelectorMove" },
+    { "hit",  "rHit" },                   { "efs",  "rEffectStrip" },
+    { "sds",  "rSoundDirectionalSet" },   { "rvt",  "rSoundReverbTable" },
+    { "ase",  "rSoundAttributeSe" },      { "oba",  "rObjAdj" },
+    { "scs",  "rSoundCurveSet" },         { "msg",  "rMessage" },
+    { "lot",  "rLayout" },                { "stq",  "rSoundStreamRequest" },
+    { "los",  "rLotSelector" },           { "lnk",  "sLightLinker::rLightLinker" },
+    { "nck",  "rNeck" },                  { "srq",  "rSoundRequest" },
+    { "glp",  "rGoalPos" },               { "adh",  "rAdhesion" },
+    { "jex",  "rJointEx" },               { "rev",  "rSoundReverb" },
+    { "tex",  "rTexture" },               { "idm",  "sId::rIdMapList" },
+    { "lku",  "rLinkUnit" },              { "e2d",  "rEffect2D" },
+    { "equ",  "rSoundEQ" },               { "smh",  "rScrHiding" },
+    { "srd",  "rSoundRandom" },           { "cdf",  "rCloth" },
+    { "pth",  "rPath" },                  { "vib",  "rVibration" },
+    { "hkx",  "rHkCollision" },           { "seg",  "rSoundSeGenerator" },
+    { "lcm",  "rCameraList" },            { "chn",  "rChain" },
+    { "ptl",  "rPathList" },              { "egv",  "rSoundEngineValue" },
+    { "sdl",  "rScheduler" },             { "mse",  "rSoundMotionSe" },
+    { "cmi",  "sCubeMapInterp" },         { "mtg",  "rModelMontage" },
+    { "ean",  "rEffectAnim" },            { "nav",  "rNavigationMesh" },
+    { "hri",  "rHkRBInfoList" },          { "bfx",  "rShader" },
+    { "sbc",  "rCollision" },             { "shp",  "rShape" },
+    { "eng",  "rSoundEngine" },           { "aef",  "rAHEffect" },
+    { "ahc",  "rAHCamera" },              { "pos",  "rPos" },
+    { "bgm",  "rBioBgmMap" },             { "mod",  "rModel" },
+    { "way",  "rAIWayPoint" },            { "shw",  "rShapeWeight" },
+    { "lsp",  "rLayoutSpr" },             { "sce",  "rScenario" },
+    { "fsm",  "rAIFSM" },                 { "stp",  "rStartPos" },
+    { "efl",  "rEffectList" },            { "ahs",  "rAreaHitShape" },
+    { "cef",  "rCommonEffect" },          { "lmt",  "rMotionList" },
+    { "rtex", "rRenderTargetTexture" },   { "sngw", "rSoundSourceMusic" },
+    { "spc",  "rSoundPackage" },
+    // rSoundReverb is .rev_win on some platforms; both spellings are accepted
+    { "rev_win", "rSoundReverb" },
+};
+
+static char g_extra_exts[32][12];
+static int  g_extra_ext_count = 0;
+
+// Parses "dds, psd;foo" -> {"dds","psd","foo"}; a leading dot is accepted.
+static void add_extra_exts(const char* list)
+{
+    const char* p = list;
+    while (p && *p && g_extra_ext_count < (int)(sizeof(g_extra_exts) / sizeof(g_extra_exts[0]))) {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';') ++p;
+        if (!*p) break;
+
+        char e[12];
+        size_t n = 0;
+        while (*p && *p != ' ' && *p != '\t' && *p != ',' && *p != ';' && n + 1 < sizeof(e))
+            e[n++] = (char)tolower((unsigned char)*p++);
+        e[n] = 0;
+        while (*p && *p != ' ' && *p != '\t' && *p != ',' && *p != ';') ++p;   // drop the tail
+
+        while (e[0] == '.') memmove(e, e + 1, strlen(e) + 1);
+        if (!e[0]) continue;
+        strncpy_s(g_extra_exts[g_extra_ext_count], sizeof(g_extra_exts[0]), e, _TRUNCATE);
+        ++g_extra_ext_count;
+    }
+}
+
+static bool ext_supported(const char* ext)
+{
+    if (!ext || !*ext) return false;
+    for (size_t i = 0; i < sizeof(kResTypes) / sizeof(kResTypes[0]); ++i)
+        if (strcmp(kResTypes[i].ext, ext) == 0) return true;
+    for (int i = 0; i < g_extra_ext_count; ++i)
+        if (strcmp(g_extra_exts[i], ext) == 0) return true;
+    return false;
+}
 
 static void lower_copy(char* dst, size_t dst_size, const char* src)
 {
@@ -1500,28 +1822,54 @@ static const char* find_override(const char* base, const char* ext)
     return nullptr;
 }
 
-static void add_override(const char* full, const char* rel)
+// Counts a file the loader will not use and logs it (first kSkipLogLines only).
+static void skip_log(const char* rel, const char* why)
 {
-    if (g_fov_count >= (int)(sizeof(g_fov) / sizeof(g_fov[0]))) return;
+    ++g_fov_skipped;
+    if (g_fov_skipped <= kSkipLogLines)
+        log_line("override skip: %s (%s)", rel, why);
+}
+
+static bool add_override(const char* full, const char* rel)
+{
+    if (g_fov_count >= FOV_MAX) { ++g_fov_dropped; return false; }
 
     const char* dot = strrchr(rel, '.');
-    if (!dot || dot == rel) return;
+    if (!dot || dot == rel) { skip_log(rel, "no extension"); return false; }
+
     size_t base_len = (size_t)(dot - rel);
-    if (base_len == 0 || base_len >= sizeof(g_fov[0].base)) return;
+    if (base_len == 0 || base_len >= sizeof(g_fov[0].base)) { skip_log(rel, "path too long"); return false; }
+
+    char ext[12];
+    lower_copy(ext, sizeof(ext), dot + 1);
+    if (!ext[0]) { skip_log(rel, "no extension"); return false; }
+
+    if (g_override_whitelist && !ext_supported(ext)) {
+        char why[64];
+        snprintf(why, sizeof(why), "type .%s is not a game resource", ext);
+        skip_log(rel, why);
+        return false;
+    }
 
     FileOverride& o = g_fov[g_fov_count];
     for (size_t i = 0; i < base_len; ++i)
         o.base[i] = (char)tolower((unsigned char)rel[i]);
     o.base[base_len] = 0;
-    lower_copy(o.ext, sizeof(o.ext), dot + 1);
+    strncpy_s(o.ext, sizeof(o.ext), ext, _TRUNCATE);
     strncpy_s(o.file, sizeof(o.file), full, _TRUNCATE);
     ++g_fov_count;
     log_line("override file: %s (%s)", rel, o.ext);
+    return true;
 }
 
+// Walks the whole folder even when the table is full, so the report at the end
+// says how many files were dropped instead of stopping silently.
 static void scan_override_dir(const char* dir, const char* rel, int depth)
 {
-    if (depth > 8 || g_fov_count >= (int)(sizeof(g_fov) / sizeof(g_fov[0]))) return;
+    if (depth > 8) {
+        skip_log(rel, "deeper than 8 levels");
+        return;
+    }
 
     char mask[MAX_PATH];
     snprintf(mask, sizeof(mask), "%s\\*", dir);
@@ -1828,6 +2176,21 @@ static DWORD WINAPI file_override_thread(LPVOID)
     return 0;
 }
 
+// Startup report: what was indexed, what was skipped and why, what did not fit.
+static void report_override_scan(const char* dir)
+{
+    log_line("file overrides: %d/%d file(s) indexed from %s", g_fov_count, FOV_MAX, dir);
+    if (g_fov_skipped) {
+        log_line("file overrides: %d item(s) not indexed (unsupported type or folder too deep%s)",
+                 g_fov_skipped, g_override_whitelist ? "" : ", whitelist off");
+        if (g_fov_skipped > kSkipLogLines)
+            log_line("file overrides: only the first %d reasons are listed above", kSkipLogLines);
+    }
+    if (g_fov_dropped)
+        log_line("file overrides: %d file(s) DROPPED - the %d-entry limit was hit; "
+                 "remove unused files from %s", g_fov_dropped, FOV_MAX, dir);
+}
+
 static void init_file_overrides(const char* dir, const char* exe_dir)
 {
     (void)exe_dir;
@@ -1840,13 +2203,19 @@ static void init_file_overrides(const char* dir, const char* exe_dir)
     strcat_s(g_fov_dir, sizeof(g_fov_dir), "re5_file_overrides");
     CreateDirectoryA(g_fov_dir, nullptr);
 
+    log_line("file overrides: type whitelist %s (%d built-in + %d extra type(s))",
+             g_override_whitelist ? "on" : "OFF - any file is indexed",
+             (int)(sizeof(kResTypes) / sizeof(kResTypes[0])), g_extra_ext_count);
+
     scan_override_dir(g_fov_dir, "", 0);
-    log_line("file overrides: %d file(s) in %s", g_fov_count, g_fov_dir);
+    report_override_scan(g_fov_dir);
+
     if (!g_fov_count) return;
 
     HANDLE h = CreateThread(nullptr, 0, file_override_thread, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
 }
+
 
 static DWORD WINAPI worker(LPVOID)
 {
@@ -1917,9 +2286,11 @@ static DWORD WINAPI worker(LPVOID)
     }
 
     // Per-costume weapon offsets: rewrite the table entry inside the mount
-    // function (needs the bone sites to locate it). Nothing to do - and no
-    // extra code patch - when no [WPxx] subsection was configured.
-    if (g_char_weapon_count > 0) {
+    // function (needs the bone sites to locate it). Also installed when any
+    // costume asks for a joint id above 127: that id travels through the same
+    // function's joint getter (see the vtable hook), so the hook must run even
+    // with no [WPxx] subsections configured.
+    if (g_char_weapon_count > 0 || any_wide_bone()) {
         for (int i = 0; i < 30; ++i) {
             if (install_mount_hook()) break;
             Sleep(1000);

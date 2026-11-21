@@ -315,7 +315,94 @@ Additional guard: after `create` returns, `mState & 1` (`cResource + 0x4C`) is
 checked; if the resource did not actually load, the archive entry is used as
 before (a broken override is not fatal).
 
-### 4.4 Enigma and the delivery delay
+### 4.4 The index built at startup
+
+Both detours need an O(1) answer to "does this `(path, type)` have a file?", so
+the folder is walked once in `init_file_overrides` (`FindFirstFile`, depth ≤ 8,
+names starting with `.` ignored) and every kept file becomes one entry:
+
+```c
+struct FileOverride { char base[160]; char ext[12]; char file[MAX_PATH]; };
+static FileOverride g_fov[256];      // FOV_MAX
+```
+
+`base` is the relative path without its extension, `ext` the extension, both
+lowercased — Windows is case-insensitive, the TOC paths differ in case between
+builds. Lookups are a linear scan (`find_override`) over at most 256 entries,
+which is nothing next to a TOC pass.
+
+Two filters apply while indexing, because the *presence* of a file is not free:
+
+* **type whitelist** (`kResTypes`, `file_override_whitelist`) — only extensions
+  the engine can ask for, taken from the game's own DTI table (below).
+  Previews, backups (`pl0000.mod.bak`), source `.dds`/`.psd` and readme files
+  are rejected here; `file_override_exts` adds types,
+  `file_override_whitelist=0` disables the filter (old behaviour: everything
+  indexed);
+* **entry limit** (`FOV_MAX`, 256) — the walk continues after the table is
+  full so the startup report can say how many files were dropped instead of
+  silently truncating mid-tree.
+
+Every decision is logged (`override file:` / `override skip: <rel> (<why>)`,
+per-file lines capped at 64, then totals). The scan result decides whether the
+hooks are installed at all: an empty folder means no detours are written, so a
+folder that was empty at startup is only picked up on the next run.
+
+### 4.4.1 RE5 resource types
+
+The `(type id -> extension -> class)` table, i.e. what `getExt()` returns for
+every class the game can instantiate. `sResource::precreate` only sees the TOC
+path (no extension), so this table is the only way to tell `pl0000.mod` from
+`pl0000.chn` for the same base path.
+
+| ext | class | ext | class |
+|---|---|---|---|
+| `.ccl` | `rChainCol` | `.cmi` | `sCubeMapInterp::rCubeMapInterp` |
+| `.lom` | `rLotSelectorMove` | `.mtg` | `rModelMontage` |
+| `.hit` | `rHit` | `.ean` | `rEffectAnim` |
+| `.efs` | `rEffectStrip` | `.nav` | `rNavigationMesh` |
+| `.sds` | `rSoundDirectionalSet` | `.hri` | `rHkRBInfoList` |
+| `.rvt` | `rSoundReverbTable` | `.bfx` | `rShader` |
+| `.ase` | `rSoundAttributeSe` | `.sbc` | `rCollision` |
+| `.oba` | `rObjAdj` | `.shp` | `rShape` |
+| `.scs` | `rSoundCurveSet` | `.eng` | `rSoundEngine` |
+| `.msg` | `rMessage` | `.aef` | `rAHEffect` |
+| `.lot` | `rLayout` | `.ahc` | `rAHCamera` |
+| `.stq` | `rSoundStreamRequest` | `.pos` | `rPos` |
+| `.los` | `rLotSelector` | `.bgm` | `rBioBgmMap` |
+| `.lnk` | `sLightLinker::rLightLinker` | `.mod` | `rModel` |
+| `.nck` | `rNeck` | `.way` | `rAIWayPoint` |
+| `.srq` | `rSoundRequest` | `.shw` | `rShapeWeight` |
+| `.glp` | `rGoalPos` | `.lsp` | `rLayoutSpr` |
+| `.adh` | `rAdhesion` | `.sce` | `rScenario` |
+| `.jex` | `rJointEx` | `.fsm` | `rAIFSM` |
+| `.rev` | `rSoundReverb` (`.rev_win` on some platforms) | `.stp` | `rStartPos` |
+| `.tex` | `rTexture` | `.efl` | `rEffectList` |
+| `.idm` | `sId::rIdMapList` | `.ahs` | `rAreaHitShape` |
+| `.lku` | `rLinkUnit` | `.cef` | `rCommonEffect` |
+| `.e2d` | `rEffect2D` | `.lmt` | `rMotionList` |
+| `.equ` | `rSoundEQ` | `.rtex` | `rRenderTargetTexture` |
+| `.smh` | `rScrHiding` | `.sngw` | `rSoundSourceMusic` |
+| `.srd` | `rSoundRandom` | `.spc` | `rSoundPackage` |
+| `.cdf` | `rCloth` | | |
+| `.pth` | `rPath` | | |
+| `.vib` | `rVibration` | | |
+| `.hkx` | `rHkCollision` | | |
+| `.seg` | `rSoundSeGenerator` | | |
+| `.lcm` | `rCameraList` | | |
+| `.chn` | `rChain` | | |
+| `.ptl` | `rPathList` | | |
+| `.egv` | `rSoundEngineValue` | | |
+| `.sdl` | `rScheduler` | | |
+| `.mse` | `rSoundMotionSe` | | |
+
+`kResTypes` in `dllmain.cpp` holds the same 65 entries plus `.rev_win`. Note
+that the extension is *not* a reliable hint about the content: `.sbc` is
+collision (`rCollision`), not sound, and `.sdl` is the scheduler, not a shader
+(shaders are `.bfx`). Types are matched exactly — the game asks for one of
+these strings, and a file named with anything else is never read.
+
+### 4.5 Enigma and the delivery delay
 
 The retail exe is Enigma-packed and checks its own code integrity at startup.
 Patching any of the functions above before that check finishes makes the game
@@ -324,7 +411,7 @@ are therefore installed after `delay_ms` (10 s by default), which is late
 enough for the check and early enough for character/stage archives (they are
 mounted tens of seconds into a level).
 
-### 4.5 Signatures used at runtime
+### 4.6 Signatures used at runtime
 
 ```
 sResource::create       55 8B EC 83 E4 F8 83 EC 0C 8B 45 08
@@ -338,12 +425,39 @@ Observed on the Enigma-packed retail build: `create` `0x448B70`, `precreate`
 `0x448840`, `getFullPath` `0x4487D0`, `rArchive::load` `0x40FB50` — i.e. the
 2018-build addresses are shifted, so only the signatures are reliable.
 
-### 4.6 Coexistence
+### 4.7 Coexistence
 
 If `re5_loose_loader.asi` (the standalone loader) is present in the same folder,
 this mod skips its own override hooks — two detours on the same functions would
 patch each other's jump and crash. In that configuration the standalone
 loader's `re5_overrides\` folder is the active one.
+
+### 4.8 Hot-path budget (stutter with the Ultimate Trainer)
+
+`decide_c` is reached from a code site the game evaluates for every player,
+every frame. Two things used to run unbounded there and produced visible
+stutter as soon as another tool touched the same bytes:
+
+* `find_bone_sites()` — a full address-space walk (`VirtualQuery` +
+  `ReadProcessMemory` in 64 KB chunks). It was retried on every call while
+  `g_bone_fem_addr` was still 0, so if the mount signature never matched
+  (trainer patched it, or a foreign build) the game rescanned its whole memory
+  60×/s. Now: image-scope scan first (the mount code is in `re5dx9.exe`, so
+  ~its `SizeOfImage` instead of every executable region), one attempt per 2 s,
+  at most 20 attempts, then a single log line and `custom_bone` off.
+* `write_bone_bytes()` / `reset_bone_bytes()` — each change did
+  `VirtualProtect` + *suspend every thread* + write + `FlushInstructionCache`.
+  Costume switching alone is fine, but two writers (trainer "Handedness" /
+  "Weapon on back", or co-op with two costumes asking for different joints)
+  turn it into an every-frame stop-the-world. Now: byte stores are plain atomic
+  writes (no thread suspension — the patched byte is an immediate operand of
+  `push imm8`, so a torn state is not possible), and writes are capped at 8 per
+  250 ms window; exceeding it locks `custom_bone` for the session with a log
+  line naming the reason.
+
+The process check for `RE5GEUltimateTrainer.exe` (Toolhelp32) exists only to
+explain the symptom in the log — the trainer is 64-bit and separate, so it is
+not a module and cannot be detected by `GetModuleHandle`.
 
 ---
 

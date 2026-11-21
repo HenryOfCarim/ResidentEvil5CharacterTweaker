@@ -10,7 +10,9 @@ An ASI mod for **Resident Evil 5 (PC)** that adds **per-costume** tweaks:
   loaded.
 - **File overrides (loose files)** — drop unpacked files into
   `re5_file_overrides\` and they replace the matching `.arc` entries (any file
-  size, no repacking).
+  size, no repacking). Only extensions the game can actually load are indexed;
+  previews, backups and source files are skipped and listed in the log
+  (up to 256 overrides at a time).
 
 Configuration is keyed by **class name (costume)**, not by character, and mods
 can ship per-costume override files without touching the master config.
@@ -22,11 +24,13 @@ can ship per-costume override files without touching the master config.
 | Feature | Key | Values |
 |---|---|---|
 | Back weapon on/off | `back` | `-1` vanilla, `0` never, `1` force |
-| Custom mount joint | `custom_bone` + `bone` | `0/1`, joint No `0..127` |
+| Custom mount joint | `custom_bone` + `bone` | `0/1`, joint No `0..255` |
 | Chain simulation | `chn` | `0` off, `1` `.chn`, `2` `.ccl`, `3` both |
 | Per-costume weapon offsets | `[WPxx]` inside a class section | `pos117` / `rot117` / `pos2` / `rot2` |
 | Dump weapon offsets | `dump_weapons` | `0` off (default), `1` writes `%TEMP%\re5_weapon_offsets.txt` |
 | File overrides | `file_overrides` | `1` on, `0` off (files from `re5_file_overrides\`) |
+| File override type filter | `file_override_whitelist` | `1` only game resource types (default), `0` index every file |
+| Extra file override types | `file_override_exts` | comma-separated extensions, e.g. `abc,def` |
 
 ---
 
@@ -81,7 +85,7 @@ the `.asi`:
 
 | File | Purpose |
 |---|---|
-| `re5_ct_settings.ini` | global switches: `file_overrides`, `delay_ms`, `dump_weapons` |
+| `re5_ct_settings.ini` | global switches: `file_overrides`, `file_override_whitelist`, `file_override_exts`, `delay_ms`, `dump_weapons` |
 | `re5_ct_characters.ini` | one section per **class (costume)** plus `[default]`, optional `[WPxx]` subsections |
 | `re5_ct_weapons.ini` | one section per **weapon** (`[WPxx]`), mount offsets |
 
@@ -93,9 +97,11 @@ ship files for them: `re5_char_overrides\`, `re5_weapon_overrides\`,
 
 ```ini
 [settings]
-file_overrides=1   ; 1 = re5_file_overrides\ overrides .arc entries
-delay_ms=10000     ; wait before patching (Enigma integrity check)
-dump_weapons=0     ; 1 = write %TEMP%\re5_weapon_offsets.txt
+file_overrides=1            ; 1 = re5_file_overrides\ overrides .arc entries
+file_override_whitelist=1   ; 1 = index only types the game can load
+file_override_exts=         ; extra extensions, comma separated
+delay_ms=10000              ; wait before patching (Enigma integrity check)
+dump_weapons=0              ; 1 = write %TEMP%\re5_weapon_offsets.txt
 ```
 
 `re5_ct_characters.ini` — one section per class plus `[default]`; keys not set
@@ -372,6 +378,52 @@ The resource type is resolved exactly from the DTI
 `rChain` -> `.chn`, `rChainCol` -> `.ccl`, `rEffectList` -> `.efl`, ... A file
 with a different extension will not be picked up. Path case does not matter.
 
+#### What gets indexed
+
+The folder is scanned **once, at startup**. Every file is keyed by
+`(path without extension, extension)`, both lowercased, and only files whose
+extension is a **resource type the game loads** are kept. The list is the
+game's own DTI table (65 types, `rModel` -> `.mod`, `rTexture` -> `.tex`,
+`rChain` -> `.chn`, ...); the common ones:
+
+```
+models / motion   mod mtg jex lmt tex rtex
+cloth / physics   chn ccl cdf hkx sbc shp
+effects           efl efs ean e2d cef aef
+stage / logic     sce fsm lot los lom nav way lcm
+audio             srq sds scs equ srd mse sngw stq bgm eng seg spc rvt ase egv
+text / ui / misc  msg ahc ahs hit lsp shw smh
+```
+
+Anything else — `readme.txt`, `preview.png`, `pl0000.mod.bak`, a source `.dds`,
+a `.7z` — is **skipped and logged**, so it neither loads nor wastes a slot.
+The full extension -> class table is in
+[`docs/TECHNICAL.md`](docs/TECHNICAL.md#44-the-index-built-at-startup).
+Two ini keys change that behaviour:
+
+```ini
+file_override_whitelist=1   ; 0 = index every file (old behaviour)
+file_override_exts=dds      ; add types the table does not have
+```
+
+At most **256** files are indexed. The scan keeps going after the table is
+full so the final log line reports exactly how many files were dropped — if
+that line appears, remove unused files from the folder.
+
+The log (`%TEMP%\re5_char_tweaks.log`) therefore says what happened:
+
+```
+file overrides: type whitelist on (66 built-in + 0 extra type(s))
+override file: pawn\pl\pl00\model\pl0000.mod (mod)
+override skip: tools\readme.txt (type .txt is not a game resource)
+override skip: backup\pl0000.mod.orig (type .orig is not a game resource)
+file overrides: 12/256 file(s) indexed from ...\re5_file_overrides
+file overrides: 4 item(s) not indexed (unsupported type or folder too deep)
+```
+
+Per-file skip lines stop after the first 64 so a folder full of junk cannot
+fill the log; the summary always reports the totals.
+
 Notes:
 
 * the hooks are installed **~10 s after start** (`delay_ms`): the retail exe is
@@ -382,14 +434,18 @@ Notes:
   single costume, repack that `.arc`;
 * a broken file is not fatal: if `create` cannot load it, the archive entry is
   used as before;
+* the folder is indexed once — files added while the game runs are picked up on
+  the next start (a folder that was empty at startup installs no hooks at all);
 * if `re5_loose_loader.asi` is installed in the same folder, this mod skips its
   own file-override hooks (the standalone loader does the same job).
 
 Config keys (in `re5_ct_settings.ini`):
 
 ```ini
-file_overrides=1   ; 0 = disable the file-override hooks
-delay_ms=10000     ; how long to wait before patching code (Enigma check)
+file_overrides=1            ; 0 = disable the file-override hooks
+file_override_whitelist=1   ; 0 = index files of any type
+file_override_exts=         ; extra types, comma separated
+delay_ms=10000              ; how long to wait before patching code (Enigma check)
 ```
 
 See [`docs/TECHNICAL.md`](docs/TECHNICAL.md) for the address table and the
@@ -414,6 +470,19 @@ g++ -m32 -shared -O2 -static-libgcc -static-libstdc++ -o dist\re5_char_tweaks.as
 Output:
 
 - `dist/re5_char_tweaks.asi`
+
+### Tests
+
+`tests/fov_test.cpp` covers the loose-file indexer (whitelist, skip logging,
+256-entry limit, ini wiring) without the game or the exe — it includes
+`dllmain.cpp` and builds a throwaway folder tree under `%TEMP%`:
+
+```bat
+g++ -m32 -O1 -o tests\fov_test.exe tests\fov_test.cpp
+tests\fov_test.exe
+```
+
+Exit code `0` = all cases passed.
 
 ---
 
@@ -442,9 +511,50 @@ chain slots: uPl07RebeccaNormal table=... chn=on ccl=on
 | `class=` empty / `?` | class identification failed — send the log |
 | `mount hook: site pattern not found` | the mount function differs in your build — per-costume weapon offsets stay off, send the log |
 | `chain slots:` missing for `chn=3` | the table was not ready yet, or the class has no model path |
+| loose file is ignored | look for `override skip: <file> (type .xxx is not a game resource)` — add that type with `file_override_exts=`; if it is not in the log at all, the game never requested that `(path, type)` |
+| `file overrides: N file(s) DROPPED` | more than 256 files in `re5_file_overrides\` — remove the unused ones |
+| stutter/hitches while the Ultimate Trainer (or another patcher) runs | both rewrite the mount joint byte; check the log for `another writer keeps changing the mount site` — disable the trainer's `Weapon on back` / `Handedness`, or the mod's `custom_bone` |
+| `bone: mount sites not found after N tries` | the mount signature is gone (another tool patched it, or an unsupported build) — `custom_bone` stays off, everything else keeps working |
 
 If the log is missing, check that Ultimate ASI Loader is installed and that the
 `.asi` is in a folder it scans (game root, `scripts`, `plugins`, `update`).
+
+---
+
+## Coexistence with the Ultimate Trainer (Raz0r/Dante)
+
+`RE5GEUltimateTrainer.exe` is an external 64-bit process, so the two mods never
+fight over a module handle — but they do touch the same game data:
+
+| Trainer option | Overlaps with |
+|---|---|
+| `Weapon on back` (Removed / Placement 1 / Placement 2) | this mod's `back` + mount hook |
+| `Handedness` (Freeze) | the mount joints this mod patches (`0x75` / `0x02`) |
+| `Character` / `Character Swap` / `Swap Character Anims` | per-class config lookup (`class_of_player`) |
+| `Size/Speed` freeze | the trainer's own warning: causes severe lags for non-local players |
+
+Both write the same mount bytes, so they can end up undoing each other every
+frame. This mod now defends itself:
+
+* site discovery in the per-frame path is rate-limited (one attempt per 2 s,
+  20 attempts, then it gives up and says so in the log);
+* joint-byte writes are capped at 8 per 250 ms — if the byte is being restored
+  by something else, custom bone is disabled for the session instead of
+  stuttering;
+* single-byte writes no longer suspend every thread (a byte store is atomic),
+  so a costume change costs microseconds instead of a scheduler round trip;
+* the log now names the trainer when it is running:
+
+```
+compat: RE5GEUltimateTrainer.exe is running - uncheck its 'Weapon on back'
+and 'Handedness' freezes if the back weapon or custom bone behaves oddly
+bone: another writer keeps changing the mount site - custom bone disabled for this session
+```
+
+Practical setup: use **one** tool for the back weapon — either the trainer's
+`Weapon on back` or this mod's `back`/`custom_bone`, not both. Leave
+`Handedness` unfrozen while testing costumes; if you need it, expect the trainer
+to win (it re-applies every frame) and see `bone: another writer...` in the log.
 
 ---
 
@@ -460,6 +570,26 @@ If the log is missing, check that Ultimate ASI Loader is installed and that the
 - Per-costume weapon offsets are written into the shared per-weapon table right
   before each mount; anything that reads that table outside the mount path sees
   the values of the costume that mounted last.
+- `custom_bone` accepts **0..255** (the model carries a 256-entry anim-joint
+  remap: `remap[anim id] = bone`, `0xFF` = no bone). The vanilla site is
+  `push imm8`, which sign-extends, so an id above 127 reaches the engine as a
+  negative number and the weapon is drawn at the world origin. The id is
+  therefore delivered through the **joint getter**: `mount` calls
+  `[actor]->vtbl[0x34](x, joint)`, and that one vtable slot is redirected to a
+  thunk that maps the encoded byte back to the real id
+  (`bone: joint getter hooked at slot ...`). The mount code itself stays
+  vanilla, so nothing has to be re-encoded and no other tool has to be detected.
+- That thunk is *lowest priority* by design: it only rewrites the exact value
+  the mod pushed. If another tool overwrites the joint byte (trainer
+  `Handedness` / `Weapon on back`), the thunk no longer matches and the other
+  tool's value wins; if the vtable slot is replaced, the feature is simply off.
+  Neither case can crash the game, and the log says which one happened.
+- If the id is valid in the model but the weapon still sits at the origin, check
+  the model's remap entry for that anim id (and that the arc you edited is the
+  one the game loads).
+- `bone=255` is not translated on purpose: its byte is `0xFF`, i.e. `-1`, which
+  is exactly what vanilla code passes for "no joint" — translating it would
+  hijack every "none" call. Ids 128..254 are translated normally.
 - Not compatible with other mods that hook the same decision site or patch the
   same resource-table slots.
 - File overrides are keyed by the archive-internal path: costumes stored in
