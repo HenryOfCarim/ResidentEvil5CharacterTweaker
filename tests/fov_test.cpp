@@ -266,7 +266,7 @@ int main()
     {
         // The mount site pushes a sign-extended byte; the thunk on the joint
         // getter maps that byte back to the real id.
-        BYTE* thunk = build_bone_thunk();
+        BYTE* thunk = build_bone_thunk(&g_bone_orig_joint[0]);
         check(thunk != nullptr, "thunk generated");
         if (thunk) {
             check(thunk[0] == 0x8B && thunk[1] == 0x54 && thunk[2] == 0x24 &&
@@ -282,14 +282,14 @@ int main()
             check(thunk[18] == 0x89 && thunk[19] == 0x54 && thunk[20] == 0x24 &&
                   thunk[21] == 0x08, "`mov [esp+8],edx`");
             check(thunk[22] == 0xFF && thunk[23] == 0x25, "`jmp [imm32]`");
-            check(*(DWORD*)(thunk + 24) == (DWORD)&g_bone_orig_joint,
-                  "jumps through g_bone_orig_joint");
+            check(*(DWORD*)(thunk + 24) == (DWORD)&g_bone_orig_joint[0],
+                  "jumps through its own g_bone_orig_joint slot");
         }
 
         // Behaviour: the thunk is jumped to by the engine with (arg1, joint) on
         // the stack and lands in the original getter by tail jump.
         g_seen_joint = -12345;
-        g_bone_orig_joint = (void*)&fake_joint_getter;
+        g_bone_orig_joint[0] = (void*)&fake_joint_getter;
         typedef void (*ThunkFn)(int, int);
 
         set_bone_encoding(220);
@@ -319,6 +319,85 @@ int main()
                  "255 is not translated (its byte is the -1 'none' sentinel)");
         set_bone_encoding(-1);
         check_eq(g_bone_enc, 0x7FFFFFFF, "reset disables the translation");
+
+        // A second thunk keeps its own original target: every weapon-model
+        // class (uWp00..uWp8c) gets its own slot.
+        BYTE* thunk2 = build_bone_thunk(&g_bone_orig_joint[1]);
+        check(thunk2 && thunk2 != thunk, "a second thunk is a separate block");
+        check(thunk2 && *(DWORD*)(thunk2 + 24) == (DWORD)&g_bone_orig_joint[1],
+              "the second thunk jumps through g_bone_orig_joint[1]");
+    }
+
+    // ---- case 7b: every weapon class gets its own joint-getter hook --------
+    printf("case 7b: per-weapon joint-getter hooks\n");
+    {
+        // Two holstered weapons are two different model classes (uWp1C,
+        // uWp03), i.e. two different vtables, so both slots must be hooked.
+        void* arena = nullptr;
+        const uintptr_t bases[] = { 0x10000000, 0x12000000, 0x14000000,
+                                    0x16000000, 0x18000000 };
+        for (uintptr_t b : bases) {
+            arena = VirtualAlloc((void*)b, 0x2000, MEM_COMMIT | MEM_RESERVE,
+                                 PAGE_EXECUTE_READWRITE);
+            if (arena) break;
+        }
+        check(arena != nullptr, "fake class arena allocated below 0x20000000");
+        if (arena) {
+            BYTE* a = (BYTE*)arena;
+            // item+0x2C -> model; model+0 -> vtable; vtable[0x34/4] -> getter
+            BYTE* item1 = a + 0x000;
+            BYTE* model1 = a + 0x100;
+            BYTE** vt1 = (BYTE**)(a + 0x400);
+            BYTE* item2 = a + 0x800;
+            BYTE* model2 = a + 0x900;
+            BYTE** vt2 = (BYTE**)(a + 0xC00);
+            // The "original" getter lives in the same arena (below 0x20000000,
+            // like a game-code pointer) and tail-jumps to the fake getter.
+            BYTE* orig_stub = a + 0x1000;
+            orig_stub[0] = 0xE9;
+            *(DWORD*)(orig_stub + 1) = (DWORD)&fake_joint_getter - ((DWORD)orig_stub + 5);
+            void* orig = (void*)orig_stub;
+
+            *(void**)(item1 + 0x2C) = model1;
+            *(void**)(item2 + 0x2C) = model2;
+            *(void**)model1 = vt1;
+            *(void**)model2 = vt2;
+            vt1[0x34 / 4] = (BYTE*)orig;
+            vt2[0x34 / 4] = (BYTE*)orig;
+
+            g_bone_slot_count = 0;
+            install_bone_slot_hook(item1, 0x011C);
+            check_eq(g_bone_slot_count, 1, "first weapon class is hooked");
+            check(vt1[0x34 / 4] != orig,
+                  "first vtbl[0x34] points at our thunk");
+            check(g_bone_orig_joint[0] == orig,
+                  "first original target is remembered");
+
+            install_bone_slot_hook(item1, 0x011C);
+            check_eq(g_bone_slot_count, 1, "mounting it again does not re-hook");
+
+            install_bone_slot_hook(item2, 0x0103);
+            check_eq(g_bone_slot_count, 2, "second weapon class gets its own hook");
+            check(vt2[0x34 / 4] != orig,
+                  "second vtbl[0x34] points at our thunk");
+            check(g_bone_orig_joint[1] == orig,
+                  "second original target is remembered");
+
+            install_bone_slot_hook(item2, 0x0005);
+            check_eq(g_bone_slot_count, 2, "a non-weapon item adds no hook");
+
+            // Both thunks translate the wide id, each to its own original.
+            typedef void (*ThunkFn)(int, int);
+            set_bone_encoding(220);
+            g_seen_joint = -1;
+            ((ThunkFn)vt1[0x34 / 4])(0, g_bone_enc);
+            check_eq(g_seen_joint, 220, "first class translates the joint");
+            g_seen_joint = -1;
+            ((ThunkFn)vt2[0x34 / 4])(0, g_bone_enc);
+            check_eq(g_seen_joint, 220, "second class translates the joint");
+            g_bone_slot_count = 0;
+            set_bone_encoding(-1);
+        }
     }
 
     // ---- case 8: the mount hook is installed for wide ids ------------------

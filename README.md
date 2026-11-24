@@ -61,13 +61,12 @@ can ship per-costume override files without touching the master config.
    (character/costume table) and `re5_ct_weapons.ini` (weapon table).
 4. Optional: create `re5_char_overrides\` / `re5_weapon_overrides\` next to
    the `.asi` for per-mod overrides (see below).
-6. Optional: create `re5_file_overrides\` next to the `.asi` for loose file
-   overrides of `.arc` entries (see "File overrides" below). If the standalone
-   `re5_loose_loader.asi` is installed in the same folder, this mod skips its
-   own file-override hooks — use that loader's `re5_overrides\` folder instead.
-7. Remove older test ASIs (`re5_excella_back.asi`, `re5_sheva_bone_test.asi`,
-   `re5_chain_slots.asi`) to avoid conflicts.
-8. Launch the game.
+5. Optional: create `re5_file_overrides\` next to the `.asi` for loose file
+   overrides of `.arc` entries (see "File overrides" below).
+6. Keep a single loose-file loader in the folders the ASI loader scans: two ASIs
+   detouring the same resource functions would overwrite each other's jump and
+   crash. `file_overrides=0` in `re5_ct_settings.ini` turns this mod's hooks off.
+7. Launch the game.
 
 If the config files are missing, the mod writes defaults for the settings and
 the character table — all 30 costumes at vanilla behaviour (`back=-1`,
@@ -237,7 +236,19 @@ The mod:
    redirected to a stub which gets the item (`ecx`), its owner via the same
    player lookup the mount function uses, the weapon id and the item manager
    (`edi` = `uPlayer + 0x21A0`), rewrites `table[id] + 0xD0..+0x10B` for that
-   costume and then runs the original instructions.
+   costume and then runs the original instructions;
+7. for a joint id above 127 (`bone=220`, …) the `push imm8` sign-extends, so the
+   id is delivered through the **joint getter** instead: the mount call is
+   `model->vtbl[0x34](parent, joint)`, and that vtable slot is redirected to a
+   thunk that maps the encoded negative byte back to the real id. Every weapon
+   has its **own model class** (`uWp00` … `uWp8c`, one vtable each), so the mod
+   hooks one slot per class — a thunk is installed the first time each weapon
+   mounts (`bone: joint getter hooked … item=WPxx` in the log). A single shared
+   hook would translate only the weapon that mounted first and leave every other
+   weapon at the world origin. This only happens when some section actually asks
+   for an id above 127; otherwise the weapon vtables are left alone, and the
+   thunk itself only rewrites the exact byte the mod pushed (hands, knife, hip
+   holster parts and enemy attaches are forwarded unchanged).
 
 File overrides are a separate pair of detours (details in
 [`docs/TECHNICAL.md`](docs/TECHNICAL.md) §4): `sResource::precreate` is stopped
@@ -436,8 +447,10 @@ Notes:
   used as before;
 * the folder is indexed once — files added while the game runs are picked up on
   the next start (a folder that was empty at startup installs no hooks at all);
-* if `re5_loose_loader.asi` is installed in the same folder, this mod skips its
-  own file-override hooks (the standalone loader does the same job).
+* only one loose-file loader may be active. This mod owns two detours
+  (`sResource::precreate`, `sResource::getFullPath`); a second ASI that patches
+  the same entry points would replace one of the jumps and crash the game.
+  Keep one such ASI in the folder, or set `file_overrides=0`.
 
 Config keys (in `re5_ct_settings.ini`):
 
@@ -515,6 +528,9 @@ chain slots: uPl07RebeccaNormal table=... chn=on ccl=on
 | `file overrides: N file(s) DROPPED` | more than 256 files in `re5_file_overrides\` — remove the unused ones |
 | stutter/hitches while the Ultimate Trainer (or another patcher) runs | both rewrite the mount joint byte; check the log for `another writer keeps changing the mount site` — disable the trainer's `Weapon on back` / `Handedness`, or the mod's `custom_bone` |
 | `bone: mount sites not found after N tries` | the mount signature is gone (another tool patched it, or an unsupported build) — `custom_bone` stays off, everything else keeps working |
+| the **first** holstered weapon uses the custom bone, every **other** weapon sits at the world origin | that weapon's model class was not hooked. The log must show one `bone: joint getter hooked at slot … item=WPxx` line per weapon; if only one line appears, the build is older than the per-class hook (see `KNOWN LIMITATIONS` on `custom_bone`) |
+| a weapon is on the right bone but floats/rotates oddly | the joint is fine, the per-weapon offset is not: the spine `pos2`/`rot2` of that weapon are still applied. Zero them for the costume (`[WPxx]` → `pos2=0,0,0` / `rot2=0,0,0` in the class section or in its `re5_char_overrides\<class>.ini`) |
+| `bone: N weapon classes hooked - no room for another one` | more than 128 different weapon classes were mounted in one session — restart the game (the limit is per process) |
 
 If the log is missing, check that Ultimate ASI Loader is installed and that the
 `.asi` is in a folder it scans (game root, `scripts`, `plugins`, `update`).
@@ -575,15 +591,19 @@ to win (it re-applies every frame) and see `bone: another writer...` in the log.
   `push imm8`, which sign-extends, so an id above 127 reaches the engine as a
   negative number and the weapon is drawn at the world origin. The id is
   therefore delivered through the **joint getter**: `mount` calls
-  `[actor]->vtbl[0x34](x, joint)`, and that one vtable slot is redirected to a
+  `[model]->vtbl[0x34](parent, joint)`, and that vtable slot is redirected to a
   thunk that maps the encoded byte back to the real id
-  (`bone: joint getter hooked at slot ...`). The mount code itself stays
-  vanilla, so nothing has to be re-encoded and no other tool has to be detected.
-- That thunk is *lowest priority* by design: it only rewrites the exact value
-  the mod pushed. If another tool overwrites the joint byte (trainer
+  (`bone: joint getter hooked at slot ... item=WPxx`). Each weapon is its own
+  model class (`uWp00` … `uWp8c`), so one thunk is installed per weapon the
+  player holsters — a shared hook would only cover the first one. The mount code
+  itself stays vanilla, so nothing has to be re-encoded and no other tool has to
+  be detected.
+- Those thunks are *lowest priority* by design: they only rewrite the exact
+  value the mod pushed. If another tool overwrites the joint byte (trainer
   `Handedness` / `Weapon on back`), the thunk no longer matches and the other
-  tool's value wins; if the vtable slot is replaced, the feature is simply off.
-  Neither case can crash the game, and the log says which one happened.
+  tool's value wins; if a vtable slot is replaced, that one weapon keeps the
+  vanilla joint. Neither case can crash the game, and the log says which one
+  happened.
 - If the id is valid in the model but the weapon still sits at the origin, check
   the model's remap entry for that anim id (and that the arc you edited is the
   one the game loads).
@@ -598,8 +618,8 @@ to win (it re-applies every frame) and see `bone: another writer...` in the log.
 - Resources the game does not request through `sResource::create` cannot be
   overridden by a hook; those still need repacking.
 - No in-game reload: an overridden file is read when the resource is loaded
-  (level start / spawn), so replacing it requires a reload of that resource
-  (the standalone `re5_loose_loader.asi` adds a warm-reload helper).
+  (level start / spawn), so replacing it requires reloading that resource
+  (reload the level or the checkpoint).
 - One instance per process.
 
 ---

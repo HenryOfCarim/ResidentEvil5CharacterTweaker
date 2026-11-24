@@ -786,16 +786,25 @@ static void reset_bone_bytes()
 //
 // Instead of owning those 5 bytes (another tool in the process may rewrite
 // them, and a torn instruction crashes the game), the id is delivered through
-// the joint getter: the mount call is `[actor]->vtbl[0x34](x, joint)`, so that
-// one vtable slot is redirected to a thunk that translates the encoded negative
-// byte into the real id. The mount code itself stays vanilla; if anything else
-// overwrites our byte - or the slot - the thunk simply does not match and the
-// game behaves as if the feature were off.
-static void* g_bone_orig_joint = nullptr;   // original vtbl[0x34]
-static void** g_bone_slot = nullptr;        // &vtbl[0x34]
-static int   g_bone_enc = 0x7FFFFFFF;       // encoded (sign-extended) byte
-static int   g_bone_val = -1;               // id to deliver instead
-static BYTE* g_bone_thunk = nullptr;        // generated translator
+// the joint getter: the mount call is `[model]->vtbl[0x34](parent, joint)`, so
+// that vtable slot is redirected to a thunk that translates the encoded
+// negative byte into the real id. The mount code itself stays vanilla; if
+// anything else overwrites our byte - or the slot - the thunk simply does not
+// match and the game behaves as if the feature were off.
+//
+// Every weapon has its **own model class** (`uWp00` ... `uWp8c`, one vtable
+// each), so the mount call goes through a different `vtbl[0x34]` slot for every
+// weapon that is ever holstered. Hooking only the first one (as this code used
+// to) translated the joint for the weapon that mounted first and left every
+// other weapon with the sign-extended byte: joint lookup miss, weapon at the
+// world origin. The slots are therefore collected per class, each with its own
+// original target and its own thunk.
+#define BONE_SLOT_MAX 128
+static void*  g_bone_orig_joint[BONE_SLOT_MAX];  // original vtbl[0x34] per class
+static void** g_bone_slot[BONE_SLOT_MAX];        // &vtbl[0x34] per class
+static int    g_bone_slot_count = 0;
+static int    g_bone_enc = 0x7FFFFFFF;           // encoded (sign-extended) byte
+static int    g_bone_val = -1;                   // id to deliver instead
 
 // Generated machine code (no inline asm, so no symbol/linkage surprises):
 //   mov  edx, [esp+8]        ; joint argument
@@ -804,8 +813,8 @@ static BYTE* g_bone_thunk = nullptr;        // generated translator
 //   mov  edx, [g_bone_val]
 //   mov  [esp+8], edx
 // pass:
-//   jmp  dword ptr [g_bone_orig_joint]
-static BYTE* build_bone_thunk()
+//   jmp  dword ptr [orig]    ; orig = that class's own vtbl[0x34]
+static BYTE* build_bone_thunk(void** orig_ptr)
 {
     BYTE* s = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE,
                                   PAGE_EXECUTE_READWRITE);
@@ -822,7 +831,7 @@ static BYTE* build_bone_thunk()
     s[i++] = 0x89; s[i++] = 0x54; s[i++] = 0x24; s[i++] = 0x08;     // mov [esp+8],edx
     s[jne_at] = (BYTE)(i - (jne_at + 1));
     s[i++] = 0xFF; s[i++] = 0x25;                                   // jmp [imm32]
-    *(DWORD*)(s + i) = (DWORD)&g_bone_orig_joint; i += 4;
+    *(DWORD*)(s + i) = (DWORD)orig_ptr; i += 4;
     return s;
 }
 
@@ -843,9 +852,21 @@ static void set_bone_encoding(int bone)
 
 // Called from the mount hook (ecx = item) before the joint push happens.
 // Validates every pointer: a wrong vtable slot would corrupt unrelated calls.
-static void install_bone_slot_hook(void* item)
+// One hook per weapon-model class - the mount path is entered again for every
+// weapon the player holsters, so all of them get their own thunk.
+static void install_bone_slot_hook(void* item, unsigned item_id)
 {
-    if (g_bone_slot || !item) return;
+    if (!item) return;
+    if (g_bone_slot_count >= BONE_SLOT_MAX) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            log_line("bone: %d weapon classes hooked - no room for another one, "
+                     "the remaining weapons keep the vanilla joint", BONE_SLOT_MAX);
+        }
+        return;
+    }
+    if ((item_id & 0xFF00) != 0x100) return;      // only real weapons mount
 
     BYTE* p = (BYTE*)item;
     void* actor = *(void**)(p + 0x2C);
@@ -858,20 +879,26 @@ static void install_bone_slot_hook(void* item)
     void* orig = *slot;
     if (!orig || (uintptr_t)orig < 0x400000 || (uintptr_t)orig > 0x20000000) return;
 
-    if (!g_bone_thunk) g_bone_thunk = build_bone_thunk();
-    if (!g_bone_thunk) return;
+    for (int i = 0; i < g_bone_slot_count; ++i)
+        if (g_bone_slot[i] == slot) return;       // this weapon class is done
+
+    int idx = g_bone_slot_count;
+    BYTE* thunk = build_bone_thunk(&g_bone_orig_joint[idx]);
+    if (!thunk) return;
 
     DWORD old = 0;
     if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
         log_line("bone: cannot hook the joint getter (slot %p)", (void*)slot);
         return;
     }
-    g_bone_orig_joint = orig;
-    *slot = (void*)g_bone_thunk;
+    g_bone_orig_joint[idx] = orig;
+    *slot = (void*)thunk;
     VirtualProtect(slot, sizeof(void*), old, &old);
 
-    g_bone_slot = slot;
-    log_line("bone: joint getter hooked at slot %p (was %p)", (void*)slot, orig);
+    g_bone_slot[idx] = slot;
+    g_bone_slot_count = idx + 1;
+    log_line("bone: joint getter hooked at slot %p (was %p) item=%04X [%d]",
+             (void*)slot, orig, item_id, g_bone_slot_count);
 }
 static DWORD find_weapon_table_base(BYTE* fem_site);
 static bool table_looks_valid(DWORD base);
@@ -1562,8 +1589,11 @@ static bool install_mount_hook()
 extern "C" void mount_apply(void* manager, void* item, unsigned item_id)
 {
     // Before the mount function pushes the joint id: make sure the joint getter
-    // can deliver ids above 127 (it only sees a sign-extended byte).
-    install_bone_slot_hook(item);
+    // can deliver ids above 127 (it only sees a sign-extended byte). Every
+    // weapon has its own model class, so this installs one thunk per class.
+    // Gated on the config: with no id above 127 in any section the mount byte
+    // is a plain joint and the weapon vtables are not touched at all.
+    if (any_wide_bone()) install_bone_slot_hook(item, item_id);
 
     static int dbg = 0;
     if (dbg < 24) {
@@ -2114,11 +2144,6 @@ static bool patch_entry(BYTE* target, size_t len, BYTE* stub, const char* what)
 
 static DWORD WINAPI file_override_thread(LPVOID)
 {
-    if (GetModuleHandleA("re5_loose_loader.asi")) {
-        log_line("file overrides: re5_loose_loader.asi present - skipping (it does the same)");
-        return 0;
-    }
-
     if (g_delay_ms > 0) {
         log_line("file overrides: waiting %d ms before patching", g_delay_ms);
         Sleep((DWORD)g_delay_ms);

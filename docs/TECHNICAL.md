@@ -179,6 +179,63 @@ not there, a small window in front of the joint-2 site is scanned. The bytes are
 re-executed in the stub, so the patch only moves the entry point and does not
 depend on the surrounding code layout.
 
+### 1.6 Joint ids above 127 and the per-weapon joint getter
+
+The two mount branches are `push imm8`, which **sign-extends**: the byte for
+joint 220 arrives at the engine as `-36`, the anim-joint lookup misses and the
+weapon is drawn at the world origin. The mod therefore does not push the id
+itself; it leaves the immediate byte as the encoded value and translates it in
+the callee:
+
+```
+mount:   mov edx,[esi]        ; esi = [item+0x2C], the weapon model
+         mov edx,[edx+0x34]   ; uCoord::setParent
+         push 0xDC            ; encoded joint (220 -> -36)
+         push eax             ; parent
+         call edx             ; setParent(model, parent, joint)
+```
+
+`vtbl[0x34]` of the weapon model is redirected to a generated thunk
+(`mov edx,[esp+8] / cmp edx,[g_bone_enc] / jne pass / mov edx,[g_bone_val] /
+mov [esp+8],edx / pass: jmp [orig]`), so only the exact value the mod pushed is
+rewritten; every other call passes through to the original function.
+
+**One hook per weapon class.** Every weapon is its own model class —
+`uWp00` … `uWp8c`, plus `uWpBow`, `uWpKnife`, `uWpLauncher`, … — so each one has
+its own vtable and its own `[vtbl+0x34]` slot. A single hook (the original
+implementation) translated the joint only for the weapon that mounted first;
+the next weapon's `setParent` still received `-36`, and the weapon appeared at
+the world origin while the first one sat on the custom bone. The log shows this
+directly: with the single hook there was exactly one
+`bone: joint getter hooked at slot …` line per process, and the slot address
+changed between sessions with the weapon that happened to mount first
+(`0x10288cc`, `0x1028e54`, `0x1029734`, … — vtables of the same family, 0x588
+bytes apart).
+
+The mod now keeps up to 128 `(slot, original target)` pairs. `mount_apply` runs
+for every mount call, so `install_bone_slot_hook` sees each weapon's model and
+installs a thunk the first time that class is holstered; the original target is
+kept per class (the pointer is the same `uCoord::setParent` for all of them, but
+per-slot storage keeps the mechanism independent of that). Mounting the same
+weapon again only re-checks the slot. A weapon that ends up at the origin is
+either not a `(id & 0xFF00) == 0x100` item (never mounted through this path) or
+its class was not seen yet.
+
+The whole mechanism is gated twice, so it stays a no-op unless a wide id is
+configured:
+
+* nothing is hooked while no section in the config has `bone > 127`
+  (`any_wide_bone()`), i.e. with `custom_bone=0` or a joint inside 0..127 the
+  weapon vtables are never touched;
+* a thunk rewrites the joint argument only when it is **exactly** the encoded
+  byte the patched mount site pushed (`-36` for 220). Weapons mounted by other
+  code paths — the model in the hands, the knife, the hip holster parts of the
+  body model, enemy attaches — go through `setParent` with their own joint, or
+  with `-1` ("no parent"), and are forwarded unchanged to the original function.
+
+`install_bone_slot_hook` also ignores anything that is not a weapon item
+(`id & 0xFF00 != 0x100`), so a mounted herb/egg cannot attract a hook.
+
 ---
 
 ## 2. Class resource tables and `.chn` / `.ccl`
@@ -427,10 +484,11 @@ Observed on the Enigma-packed retail build: `create` `0x448B70`, `precreate`
 
 ### 4.7 Coexistence
 
-If `re5_loose_loader.asi` (the standalone loader) is present in the same folder,
-this mod skips its own override hooks — two detours on the same functions would
-patch each other's jump and crash. In that configuration the standalone
-loader's `re5_overrides\` folder is the active one.
+The two detours own `sResource::precreate` and `sResource::getFullPath`. A
+second loose-file loader patching the same entry points would overwrite one of
+the jumps — the first hook to run would jump into the other mod's stub and
+crash. Run one loose-file loader at a time; `file_overrides=0` in
+`re5_ct_settings.ini` disables this mod's pair without touching anything else.
 
 ### 4.8 Hot-path budget (stutter with the Ultimate Trainer)
 
